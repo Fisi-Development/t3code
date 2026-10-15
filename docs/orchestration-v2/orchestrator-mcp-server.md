@@ -375,9 +375,10 @@ Actor and ingress are separate so agent-authored user-role messages remain
 distinguishable from human-authored messages.
 
 Agents mention another thread as `[title](t3-thread://v1/<threadId>)`. The
-link carries only the id, which resolves in the environment of the message that
-holds it. Clients show the thread's current title rather than the label, so a
-rename never leaves a stale link.
+link carries only the id. Clients look it up in the environment of the message
+that holds it first, then in the other environments they are connected to, so a
+link to a thread on another machine opens there. They show the thread's current
+title rather than the label, so a rename never leaves a stale link.
 
 List and read results report `snoozed` and `snoozedUntil`, and
 `t3_thread_list` filters on `snoozed`. The server's `isSnoozed` follows the
