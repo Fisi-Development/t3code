@@ -4,8 +4,9 @@ import * as Schema from "effect/Schema";
 
 /**
  * Agents mention another thread in Markdown as `[title](t3-thread://v1/<threadId>)`. The id is
- * the reference and resolves in the environment of the message that holds it. Titles change, so
- * clients show the thread's current title; the label only stands in for a thread they cannot see.
+ * the reference. Clients look it up in the environment of the message that holds it first, then
+ * in the other environments they are connected to. Titles change, so clients show the thread's
+ * current title; the label only stands in for a thread they cannot see.
  */
 export const THREAD_LINK_PROTOCOL = "t3-thread";
 const THREAD_LINK_HREF_PREFIX = `${THREAD_LINK_PROTOCOL}://v1/`;
@@ -21,17 +22,37 @@ export function parseThreadLinkHref(href: string): ThreadId | null {
   return Option.getOrNull(decodeThreadId(href.slice(THREAD_LINK_HREF_PREFIX.length)));
 }
 
-/**
- * Agents often percent-encode the id anyway. When the id as written names no thread, clients try
- * this decoded form. Null when decoding changes nothing or fails.
- */
-export function percentDecodedThreadLinkId(threadId: ThreadId): ThreadId | null {
+/** Agents often percent-encode the id anyway. Null when decoding changes nothing or fails. */
+function percentDecodedThreadLinkId(threadId: ThreadId): ThreadId | null {
   try {
     const decoded = decodeURIComponent(threadId);
     return decoded === threadId ? null : Option.getOrNull(decodeThreadId(decoded));
   } catch {
     return null;
   }
+}
+
+/**
+ * Links written briefly as `t3-thread://v1/<environmentId>/<threadId>`, both segments percent
+ * encoded, still name the thread. Null when the id is not in that form.
+ */
+function legacyThreadLinkId(threadId: ThreadId): ThreadId | null {
+  const segments = threadId.split("/");
+  if (segments.length !== 2 || segments[0] === "") return null;
+  try {
+    return Option.getOrNull(decodeThreadId(decodeURIComponent(segments[1]!)));
+  } catch {
+    return null;
+  }
+}
+
+/** The ids a link may name, in the order clients try them: as written, then the fallbacks. */
+export function threadLinkIdCandidates(threadId: ThreadId): ReadonlyArray<ThreadId> {
+  const candidates = [threadId];
+  for (const fallback of [percentDecodedThreadLinkId(threadId), legacyThreadLinkId(threadId)]) {
+    if (fallback !== null && !candidates.includes(fallback)) candidates.push(fallback);
+  }
+  return candidates;
 }
 
 /** A thread link whose label survives Markdown: no brackets, backslashes, or line breaks. */
@@ -61,13 +82,9 @@ export function relabelThreadLinks(
     if (href === undefined) return source;
     const written = parseThreadLinkHref(href);
     if (written === null) return source;
-    // The decoded id only stands in when the id as written names no thread.
-    const decoded = percentDecodedThreadLinkId(written);
-    const threadId =
-      title(written) === undefined && decoded !== null && title(decoded) !== undefined
-        ? decoded
-        : written;
-    const label = title(threadId)?.trim();
-    return label ? formatThreadLink(threadId, label) : source;
+    // A fallback id only stands in when the id as written names no thread.
+    const threadId = threadLinkIdCandidates(written).find((id) => title(id) !== undefined);
+    const label = threadId === undefined ? undefined : title(threadId)?.trim();
+    return threadId !== undefined && label ? formatThreadLink(threadId, label) : source;
   });
 }

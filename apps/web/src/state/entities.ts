@@ -117,6 +117,11 @@ export function useThreadShell(ref: ScopedThreadRef | null): EnvironmentThreadSh
   );
 }
 
+/** The threads a thread link in `environmentId` can open, in any connected environment. */
+export function useThreadLinkTargets(environmentId: EnvironmentId) {
+  return useAtomValue(environmentThreadShells.threadLinkTargetsAtom(environmentId));
+}
+
 export function useChildThreadInputs(ref: ScopedThreadRef | null) {
   return useAtomValue(
     ref === null ? EMPTY_THREAD_SHELLS_ATOM : environmentThreadShells.childThreadInputsAtom(ref),

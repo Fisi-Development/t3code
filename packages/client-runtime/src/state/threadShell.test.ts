@@ -14,7 +14,11 @@ import { PrimaryConnectionTarget } from "../connection/model.ts";
 import { v2Now, v2ShellSnapshot, v2ThreadShell } from "./orchestrationV2TestFixtures.ts";
 import { applyShellStreamEvent } from "./shellReducer.ts";
 import { isThreadWorking } from "./threadInbox.ts";
-import { childThreadInputsTitle, createEnvironmentThreadShellAtoms } from "./threadShell.ts";
+import {
+  childThreadInputsTitle,
+  createEnvironmentThreadShellAtoms,
+  resolveThreadLink,
+} from "./threadShell.ts";
 
 const environmentId = EnvironmentId.make("environment-v2");
 const remoteEnvironmentId = EnvironmentId.make("remote-environment-v2");
@@ -335,5 +339,92 @@ describe("v2 thread shell lists", () => {
       disposeList();
       harness.registry.dispose();
     }
+  });
+});
+
+describe("thread link targets", () => {
+  const shared = ThreadId.make("shared");
+  const remoteOnly = ThreadId.make("thread:remote:1");
+
+  function linkHarness() {
+    const harness = makeHarness([environmentId, remoteEnvironmentId]);
+    harness.registry.set(harness.snapshotAtom(environmentId), {
+      ...v2ShellSnapshot,
+      threads: [{ ...v2ThreadShell, id: shared, title: "Local copy" }],
+    });
+    harness.registry.set(harness.snapshotAtom(remoteEnvironmentId), {
+      ...v2ShellSnapshot,
+      threads: [
+        { ...v2ThreadShell, id: shared, title: "Remote copy" },
+        { ...v2ThreadShell, id: remoteOnly, title: "On the other machine" },
+      ],
+    });
+    const resolve = (from: EnvironmentId, written: string) =>
+      resolveThreadLink(
+        harness.registry.get(harness.threads.threadLinkTargetsAtom(from)),
+        ThreadId.make(written),
+      );
+    return { ...harness, resolve };
+  }
+
+  it("opens a thread only another connected environment holds in that environment", () => {
+    const { resolve, registry } = linkHarness();
+    expect(resolve(environmentId, remoteOnly)).toEqual({
+      environmentId: remoteEnvironmentId,
+      threadId: remoteOnly,
+      title: "On the other machine",
+    });
+    registry.dispose();
+  });
+
+  it("prefers the message's own environment when several hold the thread", () => {
+    const { resolve, registry } = linkHarness();
+    expect(resolve(environmentId, shared)).toMatchObject({ environmentId, title: "Local copy" });
+    expect(resolve(remoteEnvironmentId, shared)).toMatchObject({
+      environmentId: remoteEnvironmentId,
+      title: "Remote copy",
+    });
+    registry.dispose();
+  });
+
+  it("finds nothing for a thread no connected environment holds", () => {
+    const { resolve, registry } = linkHarness();
+    expect(resolve(environmentId, "deleted")).toBeNull();
+    registry.dispose();
+  });
+
+  it("follows a percent-encoded id and the old environment-qualified form", () => {
+    const { resolve, registry } = linkHarness();
+    expect(resolve(environmentId, "thread%3Aremote%3A1")).toMatchObject({
+      environmentId: remoteEnvironmentId,
+      threadId: remoteOnly,
+    });
+    expect(resolve(environmentId, `${remoteEnvironmentId}/thread%3Aremote%3A1`)).toMatchObject({
+      environmentId: remoteEnvironmentId,
+      threadId: remoteOnly,
+    });
+    registry.dispose();
+  });
+
+  it("emits only when a linked thread appears, moves, or is renamed", () => {
+    const { registry, snapshotAtom, threads } = linkHarness();
+    const targetsAtom = threads.threadLinkTargetsAtom(environmentId);
+    const dispose = registry.mount(targetsAtom);
+    const before = registry.get(targetsAtom);
+    const remote = registry.get(snapshotAtom(remoteEnvironmentId))!;
+    registry.set(snapshotAtom(remoteEnvironmentId), {
+      ...remote,
+      threads: remote.threads.map((thread) => ({ ...thread, status: "running" as const })),
+    });
+    expect(registry.get(targetsAtom)).toBe(before);
+    registry.set(snapshotAtom(remoteEnvironmentId), {
+      ...remote,
+      threads: remote.threads.map((thread) =>
+        thread.id === remoteOnly ? { ...thread, title: "Renamed" } : thread,
+      ),
+    });
+    expect(registry.get(targetsAtom).get(remoteOnly)?.title).toBe("Renamed");
+    dispose();
+    registry.dispose();
   });
 });

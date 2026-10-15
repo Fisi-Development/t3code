@@ -39,6 +39,19 @@ describe("thread links", () => {
     ).toBe("[Kept](t3-thread://v1/a%3A1)");
   });
 
+  it("reads a link in the old environment-qualified form by its thread id", () => {
+    const titles = new Map([
+      ["thread:1", "Current"],
+      ["literal/slash", "Literal"],
+    ]);
+    expect(
+      relabelThreadLinks(
+        "[Old](t3-thread://v1/environment-1/thread%3A1) [s](t3-thread://v1/literal/slash)",
+        (threadId) => titles.get(threadId),
+      ),
+    ).toBe("[Current](t3-thread://v1/thread:1) [Literal](t3-thread://v1/literal/slash)");
+  });
+
   it("leaves links inside code spans and fences as written", () => {
     const markdown = [
       "Live [old](t3-thread://v1/t1), literal `[old](t3-thread://v1/t1)`.",

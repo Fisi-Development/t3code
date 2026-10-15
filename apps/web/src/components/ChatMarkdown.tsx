@@ -2951,7 +2951,7 @@ const CHAT_MARKDOWN_COMPONENTS = {
     } = use(ChatMarkdownRendererContext);
     const citation = href ? parseAssistantCitationHref(href) : null;
     if (citation) return <AssistantCitationChip citation={citation} />;
-    // A thread link names a thread in this message's environment and opens it in the app.
+    // A thread link opens the thread in the app, in whichever connected environment holds it.
     const linkedThreadId = href ? parseThreadLinkHref(href) : null;
     if (linkedThreadId) {
       const label = hastPlainTextDeep(node) || linkedThreadId;

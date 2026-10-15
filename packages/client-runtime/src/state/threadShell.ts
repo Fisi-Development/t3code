@@ -8,6 +8,7 @@ import type {
   ThreadId,
 } from "@t3tools/contracts";
 import { isProviderNativeSubagentThread } from "@t3tools/contracts";
+import { threadLinkIdCandidates } from "@t3tools/shared/threadLinks";
 import { Atom } from "effect/reactivity";
 
 import type { EnvironmentThreadShell, PendingSubagentRequest } from "./models.ts";
@@ -97,6 +98,50 @@ export function childThreadInputsTitle(
   return children.length === 1
     ? `Subagent needs ${need}`
     : `${children.length} subagents need ${need}`;
+}
+
+/** Where a thread a link names lives, and its current title. */
+export interface ThreadLinkTarget {
+  readonly environmentId: EnvironmentId;
+  readonly title: string;
+}
+
+const EMPTY_THREAD_LINK_TARGETS: ReadonlyMap<ThreadId, ThreadLinkTarget> = new Map();
+
+/**
+ * The threads a link in `environmentId` can open, by id. A link names a thread by id alone, so
+ * that environment's own threads come first, then those of the other connected environments.
+ * A thread several other environments hold opens in the first of them.
+ */
+function threadLinkTargets(
+  environmentId: EnvironmentId,
+  connectedEnvironmentIds: Iterable<EnvironmentId>,
+  threadIndex: (
+    environmentId: EnvironmentId,
+  ) => ReadonlyMap<ThreadId, Pick<OrchestrationV2ThreadShell, "title">>,
+): ReadonlyMap<ThreadId, ThreadLinkTarget> {
+  const targets = new Map<ThreadId, ThreadLinkTarget>();
+  const seen = new Set<EnvironmentId>();
+  for (const id of [environmentId, ...connectedEnvironmentIds]) {
+    if (seen.has(id)) continue;
+    seen.add(id);
+    for (const [threadId, thread] of threadIndex(id)) {
+      if (!targets.has(threadId)) targets.set(threadId, { environmentId: id, title: thread.title });
+    }
+  }
+  return targets.size === 0 ? EMPTY_THREAD_LINK_TARGETS : targets;
+}
+
+/** The thread a `t3-thread://` link with this id opens, trying the id's fallback forms in order. */
+export function resolveThreadLink(
+  targets: ReadonlyMap<ThreadId, ThreadLinkTarget>,
+  threadId: ThreadId,
+): (ThreadLinkTarget & { readonly threadId: ThreadId }) | null {
+  for (const candidate of threadLinkIdCandidates(threadId)) {
+    const target = targets.get(candidate);
+    if (target !== undefined) return { ...target, threadId: candidate };
+  }
+  return null;
 }
 
 export function createEnvironmentThreadShellAtoms(input: {
@@ -315,6 +360,26 @@ export function createEnvironmentThreadShellAtoms(input: {
     }).pipe(Atom.withLabel(`environment-thread-shells-for-projects:${key}`));
   });
 
+  // Emits when a linkable thread appears, moves, or is renamed, not on every shell update.
+  const threadLinkTargetsAtom = Atom.family((environmentId: EnvironmentId) => {
+    let previous = EMPTY_THREAD_LINK_TARGETS;
+    return Atom.make((get) => {
+      const next = threadLinkTargets(
+        environmentId,
+        enabledEnvironmentIds(get(input.catalogValueAtom)),
+        (id) => get(environmentThreadIndexAtom(id)),
+      );
+      const unchanged =
+        next.size === previous.size &&
+        Array.from(next).every(([threadId, target]) => {
+          const before = previous.get(threadId);
+          return before?.environmentId === target.environmentId && before.title === target.title;
+        });
+      if (!unchanged) previous = next;
+      return previous;
+    }).pipe(Atom.withLabel(`environment-thread-link-targets:${environmentId}`));
+  });
+
   let previousThreadRefs: ReadonlyArray<ScopedThreadRef> = [];
   const threadRefsAtom = Atom.make((get) => {
     const refs: ScopedThreadRef[] = [];
@@ -371,6 +436,7 @@ export function createEnvironmentThreadShellAtoms(input: {
     threadShellsForProjectRefsAtom: (refs: ReadonlyArray<ScopedProjectRef>) =>
       threadShellsForProjectRefsAtomFamily(projectRefCollectionKey(refs)),
     threadShellAtom: (ref: ScopedThreadRef) => threadShellAtomFamily(threadKey(ref)),
+    threadLinkTargetsAtom,
     childThreadInputsAtom: (ref: ScopedThreadRef) => childThreadInputsAtomFamily(threadKey(ref)),
   };
 }

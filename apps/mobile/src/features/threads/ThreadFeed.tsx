@@ -209,7 +209,7 @@ import {
 } from "../../state/assets";
 import { useAtomQueryRunner } from "../../state/use-atom-query-runner";
 import { usePreparedConnection } from "../../state/session";
-import { useLiveThreadLinkLabels } from "../../state/entities";
+import { threadLinkDestination, useLiveThreadLinkLabels } from "../../state/entities";
 import { useThreadSelection } from "../../state/use-thread-selection";
 import { composerDocumentAttachmentRecord } from "../../lib/composerContext";
 import * as Option from "effect/Option";
@@ -1824,12 +1824,13 @@ export const ThreadFeed = memo(function ThreadFeed(props: ThreadFeedProps) {
   const userBubbleColor = theme["--color-user-bubble"];
   const onMarkdownLinkPress = useCallback(
     (href: string, imageEmbed = false) => {
-      // A thread link names a thread in this feed's environment.
+      // A thread link opens in whichever connected environment holds the thread.
       const linkedThreadId = parseThreadLinkHref(href);
       if (linkedThreadId) {
+        const destination = threadLinkDestination(props.environmentId, linkedThreadId);
         navigation.navigate("Thread", {
-          environmentId: String(props.environmentId),
-          threadId: String(linkedThreadId),
+          environmentId: String(destination.environmentId),
+          threadId: String(destination.threadId),
         });
         return;
       }
