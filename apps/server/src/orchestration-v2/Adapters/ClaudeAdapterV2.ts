@@ -8165,6 +8165,43 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
           readonly query: ClaudeAgentSdkQuerySession;
           readonly message: SDKMessage;
         }) {
+          const progress = input.message;
+          if (
+            progress.type === "system" &&
+            progress.subtype === "task_progress" &&
+            (yield* Ref.get(activeTurn)) !== null
+          ) {
+            const liveQuery = yield* Ref.get(queryContext);
+            if (liveQuery?.query === input.query) {
+              const bufferedStart = (yield* Ref.get(wakeBuffers))
+                .get(liveQuery.nativeThreadId)
+                ?.messages.findLast(
+                  (message) =>
+                    message.type === "system" &&
+                    message.subtype === "task_started" &&
+                    message.task_id === progress.task_id &&
+                    !isClaudeNonSubagentTask(message) &&
+                    claudeTaskTypeFromSdkMessage(message) !== CLAUDE_WORKFLOW_TASK_TYPE,
+                );
+              if (bufferedStart !== undefined) {
+                // Live progress must inherit the buffered launch before fallback discovery.
+                yield* handleSdkMessageFrame({
+                  query: input.query,
+                  message: bufferedStart,
+                  replayed: true,
+                });
+                yield* Ref.update(wakeBuffers, (current) => {
+                  const entry = current.get(liveQuery.nativeThreadId);
+                  if (entry === undefined || !entry.messages.includes(bufferedStart))
+                    return current;
+                  return new Map(current).set(liveQuery.nativeThreadId, {
+                    ...entry,
+                    messages: entry.messages.filter((message) => message !== bufferedStart),
+                  });
+                });
+              }
+            }
+          }
           if (input.message.type !== "system" || input.message.subtype !== "task_started") {
             for (const message of yield* takeReleasableSubagentFrames(input.message)) {
               yield* handleSdkMessageFrame({ query: input.query, message, replayed: true });
