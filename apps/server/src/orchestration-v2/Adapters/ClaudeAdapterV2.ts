@@ -8104,33 +8104,46 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
           ) {
             const liveQuery = yield* Ref.get(queryContext);
             if (liveQuery?.query === input.query) {
-              const bufferedStart = (yield* Ref.get(wakeBuffers))
-                .get(liveQuery.nativeThreadId)
-                ?.messages.findLast(
-                  (message) =>
-                    message.type === "system" &&
-                    message.subtype === "task_started" &&
-                    message.task_id === progress.task_id &&
-                    !isClaudeNonSubagentTask(message) &&
-                    claudeTaskTypeFromSdkMessage(message) !== CLAUDE_WORKFLOW_TASK_TYPE,
-                );
-              if (bufferedStart !== undefined) {
+              const bufferedMessages =
+                (yield* Ref.get(wakeBuffers)).get(liveQuery.nativeThreadId)?.messages ?? [];
+              const bufferedStart = bufferedMessages.findLast(
+                (message) =>
+                  message.type === "system" &&
+                  message.subtype === "task_started" &&
+                  message.task_id === progress.task_id &&
+                  !isClaudeNonSubagentTask(message) &&
+                  claudeTaskTypeFromSdkMessage(message) !== CLAUDE_WORKFLOW_TASK_TYPE,
+              );
+              if (bufferedStart?.type === "system" && bufferedStart.subtype === "task_started") {
+                const bufferedChildFrames =
+                  bufferedStart.tool_use_id === undefined
+                    ? []
+                    : bufferedMessages
+                        .slice(bufferedMessages.indexOf(bufferedStart) + 1)
+                        .filter(
+                          (message) =>
+                            parentToolUseIdFromSdkMessage(message) === bufferedStart.tool_use_id,
+                        );
                 // Live progress must inherit the buffered launch before fallback discovery.
                 yield* handleSdkMessageFrame({
                   query: input.query,
                   message: bufferedStart,
                   replayed: true,
                 });
+                for (const message of bufferedChildFrames) {
+                  yield* handleSdkMessageFrame({ query: input.query, message, replayed: true });
+                }
                 for (const message of yield* takeReleasableSubagentFrames(bufferedStart)) {
                   yield* handleSdkMessageFrame({ query: input.query, message, replayed: true });
                 }
+                const replayedFrames = new Set([bufferedStart, ...bufferedChildFrames]);
                 yield* Ref.update(wakeBuffers, (current) => {
                   const entry = current.get(liveQuery.nativeThreadId);
                   if (entry === undefined || !entry.messages.includes(bufferedStart))
                     return current;
                   return new Map(current).set(liveQuery.nativeThreadId, {
                     ...entry,
-                    messages: entry.messages.filter((message) => message !== bufferedStart),
+                    messages: entry.messages.filter((message) => !replayedFrames.has(message)),
                   });
                 });
               }
