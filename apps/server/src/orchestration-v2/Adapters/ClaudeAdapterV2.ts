@@ -8190,6 +8190,9 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
                   message: bufferedStart,
                   replayed: true,
                 });
+                for (const message of yield* takeReleasableSubagentFrames(bufferedStart)) {
+                  yield* handleSdkMessageFrame({ query: input.query, message, replayed: true });
+                }
                 yield* Ref.update(wakeBuffers, (current) => {
                   const entry = current.get(liveQuery.nativeThreadId);
                   if (entry === undefined || !entry.messages.includes(bufferedStart))
