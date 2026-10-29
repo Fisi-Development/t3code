@@ -1,3 +1,4 @@
+import * as DelegateWorktreeCommit from "../git/DelegateWorktreeCommit.ts";
 import * as Cause from "effect/Cause";
 import * as Clock from "effect/Clock";
 import * as Context from "effect/Context";
@@ -154,6 +155,7 @@ export const normalizeMcpHttpResponse = (
 const looksLikeProviderToken = (token: string) => token.length > 0 && !token.includes(".");
 
 const makeMcpAuthMiddleware = Effect.gen(function* () {
+  const commits = yield* DelegateWorktreeCommit.DelegateWorktreeCommit;
   const registry = yield* McpSessionRegistry.McpSessionRegistry;
   const clients = yield* Effect.serviceOption(McpClientAuthenticator);
   return Effect.fn("McpHttpServer.authenticateRequest")(function* (httpEffect) {
@@ -178,8 +180,15 @@ const makeMcpAuthMiddleware = Effect.gen(function* () {
         offerOAuth: Option.isSome(clients) && !looksLikeProviderToken(token),
       });
     }
+    const delegateWorktreeCommit =
+      invocation.thread !== undefined &&
+      invocation.capabilities.has("worktree") &&
+      (yield* commits.available(invocation.thread.threadId));
     return yield* httpEffect.pipe(
-      Effect.provideService(McpInvocationContext.McpInvocationContext, invocation),
+      Effect.provideService(McpInvocationContext.McpInvocationContext, {
+        ...invocation,
+        delegateWorktreeCommit,
+      }),
       Effect.map(normalizeMcpHttpResponse),
     );
   }) satisfies McpAuthMiddleware;
@@ -1003,7 +1012,7 @@ export const layerThreadToolkit = toolkitRegistration(ThreadToolkit, ThreadHandl
 const layerWorktreeToolkitRegistration = toolkitRegistration(
   WorktreeToolkit,
   WorktreeHandlers.layer,
-).pipe(Layer.provide(WorktreeMcpService.layer));
+).pipe(Layer.provide(WorktreeMcpService.layer), Layer.provide(DelegateWorktreeCommit.layer));
 
 const layerPreviewControlsRegistration = toolkitRegistration(
   PreviewControlsToolkit,
@@ -1048,7 +1057,7 @@ export const layerMcpTransport = McpServer.layerHttp({
   path: "/mcp",
   protocols: [McpProtocol.v2025_06_18],
   allowSessionTermination: true,
-}).pipe(Layer.provide(layerMcpAuthMiddleware));
+}).pipe(Layer.provide(layerMcpAuthMiddleware), Layer.provide(DelegateWorktreeCommit.layer));
 
 export const layer = Layer.mergeAll(
   layerPreviewToolkit,
@@ -1062,4 +1071,4 @@ export const layer = Layer.mergeAll(
   layerPullRequestsToolkit,
   layerDeviceToolkit,
   layerHtmlToolkit,
-).pipe(Layer.provideMerge(layerMcpTransport));
+).pipe(Layer.provideMerge(layerMcpTransport), Layer.provide(DelegateWorktreeCommit.layer));

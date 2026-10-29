@@ -1,4 +1,5 @@
-import { OrchestratorMcpFailure } from "@t3tools/contracts";
+import * as DelegateWorktreeCommit from "../../../git/DelegateWorktreeCommit.ts";
+import { OrchestratorMcpFailure, WorktreeMcpFailure } from "@t3tools/contracts";
 import * as Option from "effect/Option";
 import * as GitWorkflow from "../../../git/GitWorkflowService.ts";
 import * as Project from "../../../project/ProjectService.ts";
@@ -11,6 +12,22 @@ import * as WorktreeMcpService from "../../WorktreeMcpService.ts";
 import { WorktreeToolkit } from "./tools.ts";
 
 const handlers = {
+  t3_worktree_commit: McpToolAccess.actsAsCaller((input) =>
+    Effect.gen(function* () {
+      const scope = yield* McpInvocationContext.McpInvocationContext;
+      if (
+        scope.thread === undefined ||
+        scope.delegateWorktreeCommit !== true ||
+        !scope.capabilities.has("worktree")
+      )
+        return yield* new WorktreeMcpFailure({
+          code: "capability_denied",
+          message: "Only a delegate_task child with its own recorded worktree can commit.",
+        });
+      const commits = yield* DelegateWorktreeCommit.DelegateWorktreeCommit;
+      return yield* commits.commit(scope.thread.threadId, input);
+    }),
+  ),
   t3_worktree_list: McpToolAccess.reads((input) =>
     Effect.gen(function* () {
       const context = yield* McpInvocationContext.McpInvocationContext;

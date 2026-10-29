@@ -1,3 +1,4 @@
+import * as DelegateWorktreeCommit from "../git/DelegateWorktreeCommit.ts";
 import * as UsageLimitRecoveryWorker from "./UsageLimitRecoveryWorker.ts";
 import * as Scheduler from "../scheduling/Scheduler.ts";
 import * as Layer from "effect/Layer";
@@ -264,6 +265,7 @@ const layerManagedProjectFoldersProvided = ManagedProjectFolders.layer.pipe(
   Layer.provide(layerProjectService),
 );
 const layerThreadLaunchProvided = ThreadLaunchService.layer.pipe(
+  Layer.provide(DelegateWorktreeCommit.layer),
   Layer.provide(
     Layer.mergeAll(
       layerProjectService,

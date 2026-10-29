@@ -1,5 +1,11 @@
+import * as Context from "effect/Context";
+import * as Fiber from "effect/Fiber";
+import { McpSchema } from "effect/ai";
+import * as DelegateWorktreeCommit from "../../../git/DelegateWorktreeCommit.ts";
 import {
   WorktreeMcpFailure,
+  WorktreeMcpCommitInput,
+  WorktreeMcpCommitResult,
   OrchestratorMcpFailure,
   VcsListRefsInput,
   VcsListRefsResult,
@@ -81,7 +87,32 @@ const WorktreeListTool = Tool.make("t3_worktree_list", {
 })
   .annotate(Tool.Readonly, true)
   .annotate(Tool.Destructive, false);
+const WorktreeCommitTool = Tool.make("t3_worktree_commit", {
+  description:
+    "Commit changes in this delegate_task child worktree on its assigned child branch. Runs on the T3 server without widening the agent sandbox. message is required; paths optionally limits staging to literal relative paths, otherwise stages all changes. No hooks, fsmonitor, or push. Refuses changed Git metadata or a different HEAD branch.",
+  parameters: WorktreeMcpCommitInput,
+  success: WorktreeMcpCommitResult,
+  failure: WorktreeToolFailure,
+  failureMode: "return",
+  dependencies: [
+    McpInvocationContext.McpInvocationContext,
+    ThreadManagementService.ThreadManagementService,
+    DelegateWorktreeCommit.DelegateWorktreeCommit,
+  ],
+})
+  .annotate(Tool.Readonly, false)
+  .annotate(Tool.Destructive, true)
+  .annotate(McpSchema.EnabledWhen, () => {
+    const fiber = Fiber.getCurrent();
+    return (
+      fiber !== undefined &&
+      Context.getOrUndefined(fiber.context, McpInvocationContext.McpInvocationContext)
+        ?.delegateWorktreeCommit === true
+    );
+  });
+
 export const WorktreeToolkit = Toolkit.make(
+  WorktreeCommitTool,
   WorktreeHandoffTool,
   WorktreeStatusTool,
   WorktreeListTool,

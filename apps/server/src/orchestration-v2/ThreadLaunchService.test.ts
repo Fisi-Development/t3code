@@ -1,3 +1,4 @@
+import * as DelegateWorktreeCommit from "../git/DelegateWorktreeCommit.ts";
 import * as Scheduler from "../scheduling/Scheduler.ts";
 import * as WorktreeSetupTracker from "../project/WorktreeSetupTracker.ts";
 import * as ProjectCloneTracker from "../project/ProjectCloneTracker.ts";
@@ -224,7 +225,16 @@ function makeHarness(options: HarnessOptions = {}) {
         folderForThread: () => Effect.succeed(Option.none()),
       }),
   );
+  const recordWorktree = vi.fn<DelegateWorktreeCommit.DelegateWorktreeCommit["Service"]["record"]>(
+    () => Effect.void,
+  );
   const layerLaunch = ThreadLaunch.layer.pipe(
+    Layer.provide(
+      Layer.mock(DelegateWorktreeCommit.DelegateWorktreeCommit)({
+        branchFor: (id) => Effect.succeed(`t3/${encodeURIComponent(id)}/work`),
+        record: recordWorktree,
+      }),
+    ),
     Layer.provide(
       Layer.mergeAll(
         layerExternalServices,
@@ -271,6 +281,7 @@ function makeHarness(options: HarnessOptions = {}) {
       layerExternalServices,
     ),
     createWorktree,
+    recordWorktree,
     removeWorktree,
     renameBranch,
     generateBranchName,
@@ -3513,6 +3524,14 @@ it.effect.each(
         const child = yield* threads.getThreadProjection(delegated.childThreadId);
         assert.equal(child.thread.lineage.parentThreadId, parentThreadId);
         assert.equal(child.thread.worktreePath, "/repo-worktrees/feature");
+        assert.match(child.thread.branch!, /^t3\/.+\/work$/);
+        assert.deepEqual(harness.recordWorktree.mock.calls, [
+          [delegated.childThreadId, "/repo-worktrees/feature", child.thread.branch],
+        ]);
+        assert.isBelow(
+          harness.recordWorktree.mock.invocationCallOrder[0]!,
+          harness.runSetup.mock.invocationCallOrder[0]!,
+        );
         assert.equal(child.runs[0]?.status, cancelAsync ? "starting" : "preparing");
         assert.equal(child.thread.modelSelection.instanceId, childInstanceId);
         assert.equal(child.thread.modelSelection.model, "child-model");

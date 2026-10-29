@@ -115,3 +115,10 @@ export class WorktreeMcpFailure extends Schema.TaggedError<WorktreeMcpFailure>()
     message: Schema.String,
   },
 ) {}
+
+export const WorktreeMcpCommitInput = Schema.Struct({
+  message: TrimmedNonEmptyString,
+  paths: Schema.optional(Schema.Array(TrimmedNonEmptyString)),
+});
+export type WorktreeMcpCommitInput = typeof WorktreeMcpCommitInput.Type;
+export const WorktreeMcpCommitResult = Schema.Struct({ commitSha: TrimmedNonEmptyString });

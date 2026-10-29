@@ -1,3 +1,7 @@
+import * as DelegateWorktreeCommit from "../../../git/DelegateWorktreeCommit.ts";
+import * as FileSystem from "effect/FileSystem";
+import * as Path from "effect/Path";
+import { ChildProcess, ChildProcessSpawner } from "effect/process";
 import * as Orchestrator from "../../../orchestration-v2/Orchestrator.ts";
 import * as ProjectionStore from "../../../orchestration-v2/ProjectionStore.ts";
 import * as DeviceService from "../../../device/DeviceService.ts";
@@ -142,6 +146,82 @@ it.effect("production mcp layer lists worktree tools over http", () =>
       expect(toolNames).toContain("preview_status");
       expect(toolNames).toContain("delegate_task");
 
+      expect(toolNames).not.toContain("t3_worktree_commit");
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+      const commits = yield* DelegateWorktreeCommit.DelegateWorktreeCommit;
+      const root = yield* fs.makeTempDirectoryScoped({ prefix: "t3-commit-visibility-" });
+      const repo = path.join(root, "repo");
+      const child = path.join(root, "child");
+      yield* fs.makeDirectory(repo);
+      const git = (...args: string[]) =>
+        spawner.exitCode(ChildProcess.make("git", ["-C", repo, ...args]));
+      expect(yield* git("init", "-b", "main")).toBe(0);
+      expect(
+        yield* git(
+          "-c",
+          "user.name=Test",
+          "-c",
+          "user.email=test@example.com",
+          "commit",
+          "--allow-empty",
+          "-m",
+          "initial",
+        ),
+      ).toBe(0);
+      const childId = ThreadId.make("delegate-with-worktree");
+      const branch = yield* commits.branchFor(childId);
+      expect(yield* git("worktree", "add", "-b", branch, child)).toBe(0);
+      yield* commits.record(childId, child, branch);
+      // Identical client profiles must still get a list scoped to their authenticated thread.
+      for (const [threadId, expected] of [
+        [childId, true],
+        [ThreadId.make("delegate-without-worktree"), false],
+        [ThreadId.make("non-delegate"), false],
+        [childId, true],
+      ] as const) {
+        const credential = yield* McpSessionRegistry.issueActiveMcpCredential({
+          threadId,
+          providerInstanceId: ProviderInstanceId.make("codex"),
+        });
+        const headers = {
+          accept: "application/json, text/event-stream",
+          authorization: credential!.config.authorizationHeader,
+        };
+        const init = yield* httpClient.post("/mcp", {
+          headers,
+          body: HttpBody.text(
+            JSON.stringify({
+              jsonrpc: "2.0",
+              id: 1,
+              method: "initialize",
+              params: {
+                protocolVersion: "2025-06-18",
+                capabilities: {},
+                clientInfo: { name: "same-profile", version: "1.0" },
+              },
+            }),
+            "application/json",
+          ),
+        });
+        const response = yield* httpClient.post("/mcp", {
+          headers: {
+            ...headers,
+            "mcp-protocol-version": "2025-06-18",
+            ...(init.headers["mcp-session-id"]
+              ? { "mcp-session-id": init.headers["mcp-session-id"] }
+              : {}),
+          },
+          body: HttpBody.text(
+            '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}',
+            "application/json",
+          ),
+        });
+        const payload = yield* decodeToolsListPayload((yield* response.text).match(/\{.*\}/s)![0]);
+        expect(payload.result.tools.some((t) => t.name === "t3_worktree_commit")).toBe(expected);
+      }
+
       const handoff = tools.find((tool) => tool.name === "t3_worktree_handoff");
       expect(handoff?.annotations?.readOnlyHint).toBe(false);
       expect(handoff?.annotations?.destructiveHint).toBe(true);
@@ -158,6 +238,7 @@ it.effect("production mcp layer lists worktree tools over http", () =>
       }
     }),
   ).pipe(
+    Effect.provide(DelegateWorktreeCommit.layer),
     Effect.provide(
       Layer.mergeAll(
         NodeHttpServer.layerTest,
