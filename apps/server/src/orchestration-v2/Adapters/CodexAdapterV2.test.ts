@@ -437,6 +437,40 @@ describe("CodexAdapterV2 runtime policy", () => {
     }),
   );
 
+  it.effect("adds Git roots only to workspace-write and retains existing roots", () =>
+    Effect.gen(function* () {
+      for (const sandboxPolicy of [
+        { type: "workspaceWrite", writableRoots: ["/existing"] },
+        { type: "readOnly" },
+        { type: "dangerFullAccess" },
+      ] as const) {
+        const params = yield* CodexAdapterV2.buildCodexTurnStartParams({
+          nativeThreadId: "native-worktree",
+          codexInput: [],
+          runtimePolicy: {
+            runtimeMode: "auto",
+            interactionMode: "default",
+            cwd: "/child",
+            sandboxPolicy,
+          },
+          modelSelection: { instanceId: ProviderInstanceId.make("codex"), model: "gpt-5.4" },
+          gitWritableRoots: ["/git/worktrees/child", "/git/objects", "/existing"],
+        });
+        if (params.sandboxPolicy?.type === "workspaceWrite") {
+          assert.deepEqual(params.sandboxPolicy.writableRoots, [
+            "/existing",
+            "/git/worktrees/child",
+            "/git/objects",
+          ]);
+          assert.equal(params.approvalPolicy, "on-request");
+          assert.equal(params.approvalsReviewer, "auto_review");
+        } else {
+          assert.equal(params.sandboxPolicy?.type, sandboxPolicy.type);
+        }
+      }
+    }),
+  );
+
   it.effect("preserves explicit Codex turn policy overrides", () =>
     Effect.gen(function* () {
       const params = yield* CodexAdapterV2.buildCodexTurnStartParams({

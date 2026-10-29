@@ -1,3 +1,4 @@
+import { codexWorktreeWritableRoots } from "../../provider/CodexWorktreeSandbox.ts";
 import { revertCodexThread } from "../../provider/CodexThreadRevert.ts";
 import { historyResponseItems } from "@t3tools/provider-core/server/handoffBudget";
 import { makeProviderTextDeltaCoalescer } from "./ProviderTextDeltaCoalescer.ts";
@@ -718,6 +719,7 @@ function codexRuntimeModeTurnDefaults(runtimeMode: RuntimeMode): {
 }
 
 export function buildCodexTurnStartParams(input: {
+  readonly gitWritableRoots?: ReadonlyArray<string>;
   readonly nativeThreadId: string;
   readonly codexInput: ReadonlyArray<CodexSchema.V2TurnStartParams__UserInput>;
   readonly runtimePolicy: ProviderAdapter.ProviderAdapterV2RuntimePolicy;
@@ -735,10 +737,19 @@ export function buildCodexTurnStartParams(input: {
       input.runtimePolicy.approvalPolicy === undefined
         ? runtimeModeDefaults.approvalPolicy
         : yield* decodeTurnApprovalPolicy(input.runtimePolicy.approvalPolicy);
-    const sandboxPolicy =
+    const baseSandboxPolicy =
       input.runtimePolicy.sandboxPolicy === undefined
         ? runtimeModeDefaults.sandboxPolicy
         : yield* decodeTurnSandboxPolicy(input.runtimePolicy.sandboxPolicy);
+    const sandboxPolicy =
+      baseSandboxPolicy?.type === "workspaceWrite" && input.gitWritableRoots?.length
+        ? {
+            ...baseSandboxPolicy,
+            writableRoots: [
+              ...new Set([...(baseSandboxPolicy.writableRoots ?? []), ...input.gitWritableRoots]),
+            ],
+          }
+        : baseSandboxPolicy;
     const selectedEffort =
       getModelSelectionStringOptionValue(input.modelSelection, "reasoningEffort") ??
       codexDefaultReasoningEffortOverride(input.modelSelection.model);
@@ -1634,6 +1645,7 @@ const layer: Layer.Layer<
   | FileSystem.FileSystem
   | IdAllocator.IdAllocatorV2
   | McpProviderSessions.McpProviderSessions
+  | Path.Path
   | ServerConfig
 > = Layer.effect(
   ProviderAdapter.ProviderAdapterV2,
@@ -1685,6 +1697,7 @@ export interface CodexAdapterV2Options {
 export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
   adapterOptions: CodexAdapterV2Options,
 ) {
+  const path = yield* Path.Path;
   const mcpSessions = yield* McpProviderSessions.McpProviderSessions;
   const readMcpSession = (threadId: ThreadId | null) =>
     threadId === null ? Effect.succeed(undefined) : mcpSessions.read(threadId);
@@ -6223,6 +6236,13 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
             const threadId = yield* getNativeThreadId(turnInput.providerThread);
             const mcpSession = yield* mcpSessions.read(turnInput.threadId);
             const turnStartParams = yield* buildCodexTurnStartParams({
+              gitWritableRoots:
+                turnInput.appThread.worktreePath === null
+                  ? []
+                  : yield* codexWorktreeWritableRoots(turnInput.appThread.worktreePath).pipe(
+                      Effect.provideService(Path.Path, path),
+                      Effect.provideService(FileSystem.FileSystem, fileSystem),
+                    ),
               nativeThreadId: threadId,
               codexInput,
               runtimePolicy: turnInput.runtimePolicy,
