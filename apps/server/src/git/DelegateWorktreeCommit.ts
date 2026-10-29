@@ -226,7 +226,9 @@ const make = Effect.gen(function* () {
         for (let i = 2; i < values.length; i += 3) {
           if (configured.has(values[i]!))
             return yield* refuse(
-              "Refused: selected paths use a configured Git filter; commit them outside this tool to preserve filtered content (for example Git LFS).",
+              input.paths === undefined
+                ? "Refused: stage-all includes paths using a configured Git filter. Pass explicit paths to stage only unfiltered files; commit filtered files outside this tool to preserve content (for example Git LFS)."
+                : "Refused: selected paths use a configured Git filter; commit them outside this tool to preserve filtered content (for example Git LFS).",
             );
         }
         // Reject previously staged filtered files too: write-tree may refresh their content.

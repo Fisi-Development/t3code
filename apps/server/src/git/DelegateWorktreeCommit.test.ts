@@ -113,6 +113,7 @@ describe("delegate worktree commit", () => {
         const before = yield* f.git(f.child, "rev-parse", "HEAD");
         const failure = yield* Effect.flip(f.service.commit(f.threadId, { message: "filtered" }));
         assert.include(failure.message, "configured Git filter");
+        assert.include(failure.message, "Pass explicit paths");
         assert.equal(yield* f.git(f.child, "rev-parse", "HEAD"), before);
         assert.equal(yield* f.git(f.child, "diff", "--cached", "--name-only"), "");
         assert.isFalse(yield* f.fs.exists(marker));
@@ -169,6 +170,8 @@ describe("delegate worktree commit", () => {
   it.effect("does not run configured hooks, fsmonitor, clean filters, or signing commands", () =>
     Effect.gen(function* () {
       const f = yield* fixture;
+      yield* f.git(f.child, "add", "change.txt");
+      yield* f.git(f.child, "commit", "-m", "tracked fixture");
       const callback = f.path.join(f.root, "callback");
       const marker = f.path.join(f.root, "callback-ran");
       yield* f.fs.writeFileString(
@@ -189,7 +192,12 @@ describe("delegate worktree commit", () => {
       yield* f.git(f.repo, "config", "commit.gpgsign", "true");
       yield* f.git(f.repo, "config", "gpg.program", callback);
 
-      const { commitSha } = yield* f.service.commit(f.threadId, { message: "safe commit" });
+      yield* f.fs.writeFileString(f.path.join(f.child, ".gitattributes"), "*.txt filter=test\n");
+      yield* f.fs.writeFileString(f.path.join(f.child, "change.txt"), "child work\n");
+      const { commitSha } = yield* f.service.commit(f.threadId, {
+        message: "safe commit",
+        paths: [".gitattributes"],
+      });
       assert.match(commitSha, /^[a-f0-9]{40,64}$/);
       assert.isFalse(yield* f.fs.exists(marker));
     }).pipe(Effect.scoped, Effect.provide(layer)),
