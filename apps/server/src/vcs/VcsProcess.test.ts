@@ -1,3 +1,4 @@
+import { SpawnExecutableResolution } from "@t3tools/shared/shell";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, describe, expect, it } from "@effect/vitest";
 import * as HostProcess from "@t3tools/shared/HostProcess";
@@ -57,6 +58,32 @@ const captureProcessResult = (
   );
 
 describe("VcsProcess.run", () => {
+  it.effect("pins an absolute Git executable before running in a worktree", () =>
+    Effect.gen(function* () {
+      const commands: string[] = [];
+      const service = yield* VcsProcess.make.pipe(
+        Effect.provideService(SpawnExecutableResolution, () => "/trusted/git"),
+        Effect.provideService(ProcessRunner.ProcessRunner, {
+          run: (input) => {
+            commands.push(input.command);
+            return Effect.succeed({
+              code: ChildProcessSpawner.ExitCode(0),
+              stdout: "",
+              stderr: "",
+              timedOut: false,
+              stdoutTruncated: false,
+              stderrTruncated: false,
+              stdoutInvalidUtf8: false,
+              stderrInvalidUtf8: false,
+            });
+          },
+        }),
+      );
+      yield* service.run(baseInput);
+      expect(commands).toEqual(["/trusted/git"]);
+    }),
+  );
+
   it.effect("explains a locked Git index and allows restore after the lock is released", () =>
     Effect.gen(function* () {
       const fs = yield* FileSystem.FileSystem;
@@ -190,6 +217,7 @@ describe("VcsProcess.run", () => {
       Effect.gen(function* () {
         const seen: Array<ReadonlyArray<string>> = [];
         const service = yield* VcsProcess.make.pipe(
+          Effect.provideService(SpawnExecutableResolution, () => "/trusted/git"),
           Effect.provideService(
             HostProcess.Platform,
             "platform" in scenario ? scenario.platform : "darwin",

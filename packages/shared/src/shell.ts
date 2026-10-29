@@ -903,3 +903,27 @@ export const resolveWindowsEnvironment = Effect.fn("shell.resolveWindowsEnvironm
     ? { ...baselinePatch, ...profiledPatch }
     : baselinePatch;
 });
+
+/** Resolve before entering an untrusted checkout; never fall back to cwd lookup. */
+export const resolveGitExecutable = Effect.gen(function* () {
+  const platform = yield* HostProcess.Platform;
+  const environment = yield* HostProcess.Environment;
+  const resolve = yield* SpawnExecutableResolution;
+  const path = platform === "win32" ? NodePath.win32 : NodePath.posix;
+  const absolute = (entry: string) =>
+    path.isAbsolute(entry) &&
+    (platform !== "win32" || /^[a-z]:[\\/]|^\\\\[^\\]+\\[^\\]+/i.test(entry));
+  const entries = (readEnvPath(environment) ?? "")
+    .split(pathDelimiterForPlatform(platform))
+    .map((entry) => stripWrappingQuotes(entry.trim()))
+    .filter(absolute);
+  const env = Object.fromEntries(
+    Object.entries(environment).filter(([key]) => key.toUpperCase() !== "PATH"),
+  );
+  const executable = resolve("git", platform, {
+    ...env,
+    PATH: entries.join(pathDelimiterForPlatform(platform)),
+    ...(platform === "win32" ? { PATHEXT: ".COM;.EXE" } : {}),
+  });
+  return executable !== undefined && absolute(executable) ? executable : undefined;
+});

@@ -1,3 +1,4 @@
+import { resolveGitExecutable } from "@t3tools/shared/shell";
 import { ThreadId, WorktreeMcpFailure, type WorktreeMcpCommitInput } from "@t3tools/contracts";
 import * as HostProcess from "@t3tools/shared/HostProcess";
 import * as Context from "effect/Context";
@@ -34,6 +35,7 @@ export class DelegateWorktreeCommit extends Context.Service<
       worktreePath: string,
       branch: string,
     ) => Effect.Effect<void, WorktreeMcpFailure>;
+    readonly forget: (threadId: ThreadId) => Effect.Effect<void, WorktreeMcpFailure>;
     readonly available: (threadId: ThreadId) => Effect.Effect<boolean>;
     readonly commit: (
       threadId: ThreadId,
@@ -49,6 +51,7 @@ const make = Effect.gen(function* () {
   const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
   const config = yield* ServerConfig.ServerConfig;
   const environment = yield* HostProcess.Environment;
+  const gitExecutable = yield* resolveGitExecutable;
   const directory = path.join(config.stateDir, "delegate-worktree-commits");
   // Serializes index writes through this service; ref updates also compare the old SHA.
   const lock = yield* Semaphore.make(1);
@@ -118,6 +121,8 @@ const make = Effect.gen(function* () {
   const commit = (threadId: ThreadId, input: WorktreeMcpCommitInput) =>
     lock.withPermits(1)(
       Effect.gen(function* () {
+        if (gitExecutable === undefined)
+          return yield* refuse("Refused: Git was not found in absolute PATH entries.");
         const found = yield* read(threadId);
         if (Option.isNone(found))
           return yield* refuse("Refused: this thread has no delegated worktree commit authority.");
@@ -144,7 +149,7 @@ const make = Effect.gen(function* () {
           Effect.gen(function* () {
             const handle = yield* spawner.spawn(
               ChildProcess.make(
-                "git",
+                gitExecutable,
                 [
                   "--literal-pathspecs",
                   "-c",
@@ -186,28 +191,71 @@ const make = Effect.gen(function* () {
             );
             if (exitCode !== 0)
               return yield* refuse(`Commit refused: Git ${args[0]} failed (exit ${exitCode}).`);
-            return stdout.trim();
+            return args.includes("-z") ? stdout : stdout.trim();
           });
         const ref = `refs/heads/${authority.branch}`;
         if ((yield* git(["rev-parse", "--symbolic-full-name", ref])) !== ref)
           return yield* refuse("Refused: the recorded child branch redirects to another ref.");
         const parent = yield* git(["rev-parse", "--verify", ref]);
-        // A child can select a configured clean filter via .gitattributes; disable those callbacks too.
-        const filters = yield* git(["config", "--name-only", "--list"]);
-        filterArgs.push(
-          ...filters
-            .split("\n")
-            .flatMap((name) =>
-              /^filter\..*\.(clean|process|required)$/.test(name)
-                ? ["-c", `${name}=${name.endsWith(".required") ? "false" : ""}`]
-                : [],
-            ),
+        const filterKeys = (yield* git(["config", "-z", "--name-only", "--list"])).split("\0");
+        const configured = new Set(
+          filterKeys.flatMap((name) => {
+            const match = /^filter\.([\s\S]*)\.(clean|process|required)$/.exec(name);
+            return match ? [match[1]!] : [];
+          }),
         );
+        filterArgs.push(
+          ...filterKeys.flatMap((name) =>
+            /^filter\.[\s\S]*\.(clean|process|required)$/.test(name)
+              ? ["-c", `${name}=${name.endsWith(".required") ? "false" : ""}`]
+              : [],
+          ),
+        );
+        // ls-files includes tracked, staged and untracked paths without running clean filters.
+        const candidates = yield* git([
+          "ls-files",
+          "-z",
+          "--cached",
+          "--others",
+          "--exclude-standard",
+          "--",
+          ...(input.paths ?? ["."]),
+        ]);
+        const attributes = yield* git(["check-attr", "-z", "--stdin", "filter"], candidates);
+        const values = attributes.split("\0");
+        for (let i = 2; i < values.length; i += 3) {
+          if (configured.has(values[i]!))
+            return yield* refuse(
+              "Refused: selected paths use a configured Git filter; commit them outside this tool to preserve filtered content (for example Git LFS).",
+            );
+        }
+        // Reject previously staged filtered files too: write-tree may refresh their content.
+        const staged = yield* git([
+          "diff",
+          "--cached",
+          "--name-only",
+          "-z",
+          "--no-ext-diff",
+          "--no-textconv",
+        ]);
+        const stagedAttributes = (yield* git(
+          ["check-attr", "-z", "--stdin", "filter"],
+          staged,
+        )).split("\0");
+        for (let i = 2; i < stagedAttributes.length; i += 3) {
+          if (configured.has(stagedAttributes[i]!))
+            return yield* refuse(
+              "Refused: staged paths use a configured Git filter; commit them outside this tool to preserve filtered content (for example Git LFS).",
+            );
+        }
         yield* git(["add", "--all", "--", ...(input.paths ?? ["."])]);
         const tree = yield* git(["write-tree"]);
         if (tree === (yield* git(["rev-parse", `${parent}^{tree}`])))
           return yield* refuse("Refused: there are no staged changes to commit.");
-        const commitSha = yield* git(["commit-tree", tree, "-p", parent, "-F", "-"], input.message);
+        const commitSha = yield* git(
+          ["commit-tree", tree, "-p", parent, "-F", "-"],
+          `${input.message.trimEnd()}\n\nT3-Delegate-Thread: ${threadId}\n`,
+        );
         yield* validate(authority);
         // Never update HEAD implicitly: even a concurrent checkout cannot move another branch.
         yield* git([
@@ -233,6 +281,13 @@ const make = Effect.gen(function* () {
     branchFor,
     record,
     commit,
+    forget: (threadId) =>
+      lock.withPermits(1)(
+        recordPath(threadId).pipe(
+          Effect.flatMap((file) => fs.remove(file, { force: true })),
+          Effect.mapError(() => refuse("Unable to remove child worktree authority.")),
+        ),
+      ),
     available: (threadId) =>
       read(threadId).pipe(
         Effect.map(Option.isSome),

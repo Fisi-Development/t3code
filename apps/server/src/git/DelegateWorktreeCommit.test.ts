@@ -61,11 +61,61 @@ describe("delegate worktree commit", () => {
         const result = yield* f.service.commit(f.threadId, { message: "child commit" });
         assert.equal(yield* f.git(f.child, "rev-parse", "HEAD"), result.commitSha);
         assert.equal(yield* f.git(f.child, "show", "HEAD:change.txt"), "child work");
+        assert.include(
+          yield* f.git(f.child, "log", "-1", "--format=%B"),
+          `T3-Delegate-Thread: ${f.threadId}`,
+        );
         assert.equal(yield* f.git(f.repo, "rev-parse", "main"), main);
         assert.equal(yield* f.git(f.child, "status", "--porcelain"), "");
         const restored = yield* Commits.DelegateWorktreeCommit.pipe(Effect.provide(Commits.layer));
         assert.isTrue(yield* restored.available(f.threadId));
         assert.isFalse(yield* restored.available(ThreadId.make("non-delegate")));
+      }).pipe(Effect.scoped, Effect.provide(layer)),
+  );
+  it.effect("spawns an absolute Git executable and revokes a record for recreation", () =>
+    Effect.gen(function* () {
+      const f = yield* fixture;
+      const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+      const commands: string[] = [];
+      const service = yield* Commits.DelegateWorktreeCommit.pipe(
+        Effect.provide(
+          Layer.fresh(Commits.layer).pipe(
+            Layer.provide(
+              Layer.succeed(ChildProcessSpawner.ChildProcessSpawner, {
+                ...spawner,
+                spawn: (command) => {
+                  assert.isTrue(ChildProcess.isStandardCommand(command));
+                  if (ChildProcess.isStandardCommand(command)) commands.push(command.command);
+                  return spawner.spawn(command);
+                },
+              }),
+            ),
+          ),
+        ),
+      );
+      yield* service.commit(f.threadId, { message: "absolute Git" });
+      assert.isAbove(commands.length, 0);
+      assert.isTrue(commands.every((command) => f.path.isAbsolute(command)));
+      yield* service.forget(f.threadId);
+      assert.isFalse(yield* service.available(f.threadId));
+      yield* service.record(f.threadId, f.child, f.branch);
+      assert.isTrue(yield* service.available(f.threadId));
+    }).pipe(Effect.scoped, Effect.provide(layer)),
+  );
+  it.effect(
+    "refuses LFS-style filter paths without staging raw content or running the filter",
+    () =>
+      Effect.gen(function* () {
+        const f = yield* fixture;
+        const marker = f.path.join(f.root, "filter-ran");
+        yield* f.git(f.repo, "config", "filter.lfs.clean", `touch '${marker}'`);
+        yield* f.fs.writeFileString(f.path.join(f.child, ".gitattributes"), "*.txt filter=lfs\n");
+        const before = yield* f.git(f.child, "rev-parse", "HEAD");
+        const failure = yield* Effect.flip(f.service.commit(f.threadId, { message: "filtered" }));
+        assert.include(failure.message, "configured Git filter");
+        assert.equal(yield* f.git(f.child, "rev-parse", "HEAD"), before);
+        assert.equal(yield* f.git(f.child, "diff", "--cached", "--name-only"), "");
+        assert.isFalse(yield* f.fs.exists(marker));
       }).pipe(Effect.scoped, Effect.provide(layer)),
   );
   it.effect("refuses a child branch redirected to main without moving main", () =>
@@ -138,7 +188,7 @@ describe("delegate worktree commit", () => {
       yield* f.git(f.repo, "config", "filter.test.required", "true");
       yield* f.git(f.repo, "config", "commit.gpgsign", "true");
       yield* f.git(f.repo, "config", "gpg.program", callback);
-      yield* f.fs.writeFileString(f.path.join(f.child, ".gitattributes"), "*.txt filter=test\n");
+
       const { commitSha } = yield* f.service.commit(f.threadId, { message: "safe commit" });
       assert.match(commitSha, /^[a-f0-9]{40,64}$/);
       assert.isFalse(yield* f.fs.exists(marker));

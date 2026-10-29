@@ -308,6 +308,7 @@ const make = Effect.gen(function* () {
     const reused = input.reusedWorktree;
     const tracked = input.workspaceStrategy.type === "worktree" || reused !== undefined;
     let createdWorktreePath: string | null = null;
+    let createdChildBranch: string | null = null;
     let setupTerminalId: string | null = null;
     let workspaceRecorded = false;
     let runReleased = false;
@@ -374,6 +375,7 @@ const make = Effect.gen(function* () {
         branch = yield* commits
           .branchFor(threadId)
           .pipe(Effect.mapError(mapError(input, "provision-worktree", threadId)));
+        createdChildBranch = branch;
       } else if (input.workspaceStrategy.type === "worktree" && requestedBranch === undefined) {
         const uuid = yield* randomUuidV4;
         branch = buildTemporaryWorktreeBranchName(() => uuid.replaceAll("-", ""));
@@ -685,7 +687,9 @@ const make = Effect.gen(function* () {
           if (
             tracked &&
             createdWorktreePath &&
-            ((cancelled && !runReleased) || !workspaceRecorded)
+            ((cancelled && !runReleased) ||
+              !workspaceRecorded ||
+              (input.delegatedWorktree === true && !runReleased))
           ) {
             if (branchRename !== null) yield* Fiber.interrupt(branchRename);
             const removedPath = createdWorktreePath;
@@ -695,6 +699,17 @@ const make = Effect.gen(function* () {
             yield* git
               .removeWorktree({ cwd: project.workspaceRoot, path: removedPath, force: true })
               .pipe(
+                Effect.andThen(
+                  createdChildBranch === null
+                    ? Effect.void
+                    : git
+                        .deleteLocalBranch({
+                          cwd: project.workspaceRoot,
+                          refName: createdChildBranch,
+                          force: true,
+                        })
+                        .pipe(Effect.andThen(commits.forget(threadId))),
+                ),
                 Effect.andThen(
                   threads
                     .dispatch({
