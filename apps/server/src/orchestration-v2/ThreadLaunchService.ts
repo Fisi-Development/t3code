@@ -1,3 +1,4 @@
+import * as DelegateWorktreeCommit from "../git/DelegateWorktreeCommit.ts";
 import * as WorktreeSetupTracker from "../project/WorktreeSetupTracker.ts";
 import * as ProjectCloneTracker from "../project/ProjectCloneTracker.ts";
 import * as TerminalManager from "../terminal/Manager.ts";
@@ -102,6 +103,7 @@ type PreparationInput = Pick<
   ThreadLaunchInput,
   "commandId" | "projectId" | "workspaceStrategy" | "initialMessage"
 > & {
+  readonly delegatedWorktree?: boolean;
   readonly reusedWorktree?: { readonly baseRef: string };
 };
 
@@ -196,6 +198,7 @@ function failureDetail(error: unknown): string {
 }
 
 const make = Effect.gen(function* () {
+  const commits = yield* DelegateWorktreeCommit.DelegateWorktreeCommit;
   const projects = yield* ProjectService.ProjectService;
   const setupTracker = yield* WorktreeSetupTracker.WorktreeSetupTracker;
   const cloneTracker = yield* ProjectCloneTracker.ProjectCloneTracker;
@@ -305,6 +308,7 @@ const make = Effect.gen(function* () {
     const reused = input.reusedWorktree;
     const tracked = input.workspaceStrategy.type === "worktree" || reused !== undefined;
     let createdWorktreePath: string | null = null;
+    let createdChildBranch: string | null = null;
     let setupTerminalId: string | null = null;
     let workspaceRecorded = false;
     let runReleased = false;
@@ -367,7 +371,12 @@ const make = Effect.gen(function* () {
 
       const requestedBranch = input.workspaceStrategy.branch;
       let branch: string | null;
-      if (input.workspaceStrategy.type === "worktree" && requestedBranch === undefined) {
+      if (input.workspaceStrategy.type === "worktree" && input.delegatedWorktree === true) {
+        branch = yield* commits
+          .branchFor(threadId)
+          .pipe(Effect.mapError(mapError(input, "provision-worktree", threadId)));
+        createdChildBranch = branch;
+      } else if (input.workspaceStrategy.type === "worktree" && requestedBranch === undefined) {
         const uuid = yield* randomUuidV4;
         branch = buildTemporaryWorktreeBranchName(() => uuid.replaceAll("-", ""));
       } else {
@@ -450,6 +459,11 @@ const make = Effect.gen(function* () {
         worktreePath = worktree.worktree.path;
         branch = worktree.worktree.refName;
         createdWorktreePath = worktreePath;
+        if (input.delegatedWorktree === true) {
+          yield* commits
+            .record(threadId, worktreePath, branch)
+            .pipe(Effect.mapError(mapError(input, "provision-worktree", threadId)));
+        }
         yield* setupTracker.update(threadId, (snapshot) => ({ ...snapshot, worktreePath, branch }));
         yield* setupTracker.stageStatus(threadId, "checkout", "done");
       }
@@ -673,7 +687,9 @@ const make = Effect.gen(function* () {
           if (
             tracked &&
             createdWorktreePath &&
-            ((cancelled && !runReleased) || !workspaceRecorded)
+            ((cancelled && !runReleased) ||
+              !workspaceRecorded ||
+              (input.delegatedWorktree === true && !runReleased))
           ) {
             if (branchRename !== null) yield* Fiber.interrupt(branchRename);
             const removedPath = createdWorktreePath;
@@ -683,6 +699,17 @@ const make = Effect.gen(function* () {
             yield* git
               .removeWorktree({ cwd: project.workspaceRoot, path: removedPath, force: true })
               .pipe(
+                Effect.andThen(
+                  createdChildBranch === null
+                    ? Effect.void
+                    : git
+                        .deleteLocalBranch({
+                          cwd: project.workspaceRoot,
+                          refName: createdChildBranch,
+                          force: true,
+                        })
+                        .pipe(Effect.andThen(commits.forget(threadId))),
+                ),
                 Effect.andThen(
                   threads
                     .dispatch({
@@ -1075,41 +1102,70 @@ const make = Effect.gen(function* () {
     projection: OrchestrationV2ThreadProjection,
     run: OrchestrationV2ThreadProjection["runs"][number],
     workspacePreparation: ThreadLaunchWorkspaceStrategy,
-  ) => {
-    const message = projection.messages.find((candidate) => candidate.id === run.userMessageId);
-    const reuse =
-      workspacePreparation.type === "worktree" &&
-      projection.thread.worktreePath !== null &&
-      projection.thread.branch !== null
-        ? {
-            strategy: {
-              type: "existing_worktree" as const,
-              worktreePath: projection.thread.worktreePath,
-              branch: projection.thread.branch,
-            },
-            reusedWorktree: { baseRef: workspacePreparation.baseRef },
-          }
-        : null;
-    return schedulePreparation(
-      {
-        commandId: input.commandId,
-        projectId: projection.thread.projectId,
-        workspaceStrategy: reuse?.strategy ?? workspacePreparation,
-        ...(reuse === null ? {} : { reusedWorktree: reuse.reusedWorktree }),
-        ...(message === undefined
-          ? {}
-          : {
-              initialMessage: {
-                text: message.text,
-                attachments: message.attachments,
-                ...(message.context ? { context: message.context } : {}),
+  ) =>
+    Effect.gen(function* () {
+      const message = projection.messages.find((candidate) => candidate.id === run.userMessageId);
+      const reuse =
+        workspacePreparation.type === "worktree" &&
+        projection.thread.worktreePath !== null &&
+        projection.thread.branch !== null
+          ? {
+              strategy: {
+                type: "existing_worktree" as const,
+                worktreePath: projection.thread.worktreePath,
+                branch: projection.thread.branch,
               },
-            }),
-      },
-      input.threadId,
-      run.id,
-    );
-  };
+              reusedWorktree: { baseRef: workspacePreparation.baseRef },
+            }
+          : null;
+      let delegatedWorktree = false;
+      const parentThreadId = projection.thread.lineage.parentThreadId;
+      const forkedFrom = projection.thread.forkedFrom;
+      if (
+        parentThreadId !== null &&
+        projection.thread.lineage.relationshipToParent === "subagent" &&
+        forkedFrom?.type === "node"
+      ) {
+        const parent = yield* threads.getThreadRecords(parentThreadId, ["subagents"]).pipe(
+          Effect.mapError(
+            (cause) =>
+              new ThreadLaunchError({
+                operation: "provision-worktree",
+                commandId: input.commandId,
+                projectId: projection.thread.projectId,
+                threadId: input.threadId,
+                cause,
+              }),
+          ),
+        );
+        delegatedWorktree = parent.subagents.some(
+          (task) =>
+            task.origin === "app_owned" &&
+            task.id === forkedFrom.nodeId &&
+            task.childThreadId === input.threadId,
+        );
+      }
+      return yield* schedulePreparation(
+        {
+          commandId: input.commandId,
+          projectId: projection.thread.projectId,
+          workspaceStrategy: reuse?.strategy ?? workspacePreparation,
+          delegatedWorktree,
+          ...(reuse === null ? {} : { reusedWorktree: reuse.reusedWorktree }),
+          ...(message === undefined
+            ? {}
+            : {
+                initialMessage: {
+                  text: message.text,
+                  attachments: message.attachments,
+                  ...(message.context ? { context: message.context } : {}),
+                },
+              }),
+        },
+        input.threadId,
+        run.id,
+      );
+    });
 
   return ThreadLaunchService.of({ launch, checkWorktreeBase, retryPreparation, prepareRun });
 });

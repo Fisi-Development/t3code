@@ -851,6 +851,8 @@ it.effect("terminates HTTP MCP sessions with DELETE", () =>
         issuedAt: 1,
       };
       const layerServer = McpHttpServer.layerMcpTransport.pipe(
+        Layer.provide(ServerConfig.layerTest(process.cwd(), { prefix: "t3-transport-commit-" })),
+        Layer.provide(NodeServices.layer),
         Layer.provide(
           Layer.mock(McpSessionRegistry.McpSessionRegistry)({
             resolve: (presented) =>
@@ -1105,6 +1107,8 @@ it.effect("admits provider and OAuth client credentials and points only clients 
         }),
       ).pipe(
         Layer.provideMerge(McpHttpServer.layerMcpTransport),
+        Layer.provide(ServerConfig.layerTest(process.cwd(), { prefix: "t3-auth-commit-" })),
+        Layer.provide(NodeServices.layer),
         Layer.provide(
           Layer.mock(McpSessionRegistry.McpSessionRegistry)({
             resolve: (token) =>

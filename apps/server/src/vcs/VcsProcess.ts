@@ -1,3 +1,4 @@
+import { resolveGitExecutable } from "@t3tools/shared/shell";
 import * as Context from "effect/Context";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
@@ -180,13 +181,14 @@ const canRetryFullFsync = (stderr: string) =>
 export const make = Effect.gen(function* () {
   const processRunner = yield* ProcessRunner.ProcessRunner;
   const hostPlatform = yield* HostProcess.Platform;
+  const gitExecutable = yield* resolveGitExecutable;
   const vcsProcesses = yield* Semaphore.make(VCS_PROCESS_CONCURRENCY);
   const githubProcesses = yield* Semaphore.make(GITHUB_PROCESS_CONCURRENCY);
 
   const spawn = (input: VcsProcessInput, baseError: VcsProcessErrorContext) =>
     processRunner
       .run({
-        command: input.command,
+        command: input.command === "git" ? gitExecutable! : input.command,
         args: input.args,
         cwd: input.cwd,
         ...(input.spawnCwd !== undefined ? { spawnCwd: input.spawnCwd } : {}),
@@ -240,6 +242,11 @@ export const make = Effect.gen(function* () {
       argumentCount: input.args.length,
     };
 
+    if (input.command === "git" && gitExecutable === undefined)
+      return yield* new VcsProcessSpawnError({
+        ...baseError,
+        cause: new Error("Git was not found in absolute PATH entries."),
+      });
     let result = yield* spawn(input, baseError);
 
     if (

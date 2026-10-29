@@ -1,3 +1,4 @@
+import * as DelegateWorktreeCommit from "../git/DelegateWorktreeCommit.ts";
 import * as Scheduler from "../scheduling/Scheduler.ts";
 import * as WorktreeSetupTracker from "../project/WorktreeSetupTracker.ts";
 import * as ProjectCloneTracker from "../project/ProjectCloneTracker.ts";
@@ -18,6 +19,7 @@ import {
   EnvironmentId,
   DEFAULT_SERVER_SETTINGS,
   GitCommandError,
+  WorktreeMcpFailure,
   MessageId,
   ProjectId,
   ProviderDriverKind,
@@ -206,6 +208,7 @@ function makeHarness(options: HarnessOptions = {}) {
       remoteExists: options.remoteExists ?? (() => Effect.succeed(true)),
       remoteBranchExists: () => Effect.succeed(true),
       removeWorktree,
+      deleteLocalBranch: (input) => deleteLocalBranch(input),
       ...options.git,
     }),
     Layer.succeed(ProjectSetupScriptRunner.ProjectSetupScriptRunner, {
@@ -224,7 +227,34 @@ function makeHarness(options: HarnessOptions = {}) {
         folderForThread: () => Effect.succeed(Option.none()),
       }),
   );
+  const authorities = new Set<string>();
+  const forgetWorktree = vi.fn<DelegateWorktreeCommit.DelegateWorktreeCommit["Service"]["forget"]>(
+    (id) =>
+      Effect.sync(() => {
+        authorities.delete(id);
+      }),
+  );
+  const deleteLocalBranch = vi.fn<GitWorkflow.GitWorkflowService["Service"]["deleteLocalBranch"]>(
+    () => Effect.void,
+  );
+  const recordWorktree = vi.fn<DelegateWorktreeCommit.DelegateWorktreeCommit["Service"]["record"]>(
+    (id) =>
+      authorities.has(id)
+        ? Effect.fail(
+            new WorktreeMcpFailure({ code: "invalid_request", message: "authority exists" }),
+          )
+        : Effect.sync(() => {
+            authorities.add(id);
+          }),
+  );
   const layerLaunch = ThreadLaunch.layer.pipe(
+    Layer.provide(
+      Layer.mock(DelegateWorktreeCommit.DelegateWorktreeCommit)({
+        branchFor: (id) => Effect.succeed(`t3/${encodeURIComponent(id)}/work`),
+        record: recordWorktree,
+        forget: forgetWorktree,
+      }),
+    ),
     Layer.provide(
       Layer.mergeAll(
         layerExternalServices,
@@ -271,6 +301,9 @@ function makeHarness(options: HarnessOptions = {}) {
       layerExternalServices,
     ),
     createWorktree,
+    recordWorktree,
+    forgetWorktree,
+    deleteLocalBranch,
     removeWorktree,
     renameBranch,
     generateBranchName,
@@ -3379,6 +3412,7 @@ it.effect.each(
             )
           : Effect.succeed({ commitSha: "parent-local-commit" }),
       );
+      let setupAttempts = 0;
       const harness = makeHarness({
         closeTerminal: () => Deferred.succeed(terminalClosed, undefined).pipe(Effect.asVoid),
         adapters: [
@@ -3424,7 +3458,7 @@ it.effect.each(
             : Deferred.succeed(setupEntered, undefined).pipe(
                 Effect.andThen(Deferred.await(allowSetup)),
                 Effect.andThen(
-                  failSetup
+                  failSetup && setupAttempts++ === 0
                     ? Effect.fail(
                         new ProjectSetupScriptRunner.ProjectSetupScriptOperationError({
                           threadId: "child",
@@ -3513,6 +3547,14 @@ it.effect.each(
         const child = yield* threads.getThreadProjection(delegated.childThreadId);
         assert.equal(child.thread.lineage.parentThreadId, parentThreadId);
         assert.equal(child.thread.worktreePath, "/repo-worktrees/feature");
+        assert.match(child.thread.branch!, /^t3\/.+\/work$/);
+        assert.deepEqual(harness.recordWorktree.mock.calls, [
+          [delegated.childThreadId, "/repo-worktrees/feature", child.thread.branch],
+        ]);
+        assert.isBelow(
+          harness.recordWorktree.mock.invocationCallOrder[0]!,
+          harness.runSetup.mock.invocationCallOrder[0]!,
+        );
         assert.equal(child.runs[0]?.status, cancelAsync ? "starting" : "preparing");
         assert.equal(child.thread.modelSelection.instanceId, childInstanceId);
         assert.equal(child.thread.modelSelection.model, "child-model");
@@ -3534,7 +3576,7 @@ it.effect.each(
           yield* Deferred.await(terminalClosed);
           if (!cancelAsync) {
             yield* threads
-              .streamStoredEventsFrom({ threadId: delegated.childThreadId, afterSequence })
+              .streamStoredEventsFrom({ threadId: delegated.childThreadId!, afterSequence })
               .pipe(
                 Stream.filter(
                   (stored) =>
@@ -3559,7 +3601,7 @@ it.effect.each(
         }
         yield* Deferred.succeed(allowSetup, undefined);
         yield* threads
-          .streamStoredEventsFrom({ threadId: delegated.childThreadId, eventType: "run.updated" })
+          .streamStoredEventsFrom({ threadId: delegated.childThreadId!, eventType: "run.updated" })
           .pipe(
             Stream.filter(
               (stored) =>
@@ -3571,6 +3613,37 @@ it.effect.each(
         const prepared = yield* threads.getThreadProjection(delegated.childThreadId);
         if (failSetup) {
           assert.isEmpty(prepared.checkpointScopes);
+          assert.isNull(prepared.thread.worktreePath);
+          assert.deepEqual(harness.deleteLocalBranch.mock.calls, [
+            [{ cwd: "/repo", refName: child.thread.branch!, force: true }],
+          ]);
+          assert.deepEqual(harness.forgetWorktree.mock.calls, [[delegated.childThreadId]]);
+          const afterSequence = yield* threads.getThreadEventSequence(delegated.childThreadId);
+          const launches = yield* ThreadLaunch.ThreadLaunchService;
+          yield* launches.retryPreparation({
+            commandId: CommandId.make("retry-delegated-setup"),
+            threadId: delegated.childThreadId!,
+            runId: child.runs[0]!.id,
+          });
+          yield* threads
+            .streamStoredEventsFrom({
+              threadId: delegated.childThreadId!,
+              afterSequence,
+              eventType: "run.updated",
+            })
+            .pipe(
+              Stream.filter(
+                (stored) =>
+                  stored.event.type === "run.updated" && stored.event.payload.status === "starting",
+              ),
+              Stream.runHead,
+            );
+          assert.equal(harness.createWorktree.mock.calls.length, 2);
+          assert.equal(harness.recordWorktree.mock.calls.length, 2);
+          assert.equal(
+            (yield* threads.getThreadProjection(delegated.childThreadId)).thread.branch,
+            child.thread.branch,
+          );
         } else {
           assert.equal(prepared.checkpointScopes[0]?.cwd, "/repo-worktrees/feature");
         }
