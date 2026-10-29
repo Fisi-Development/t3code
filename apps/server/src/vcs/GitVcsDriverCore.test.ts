@@ -39,6 +39,7 @@ import {
 } from "./GitVcsDriverCore.ts";
 import * as GitVcsDriver from "./GitVcsDriver.ts";
 import { gitConfigEnv } from "./VcsProcess.ts";
+import { copyIncludedWorktreeFiles } from "./worktreeInclude.ts";
 
 const encodeGitCommandError = Schema.encodeEffect(Schema.fromJsonString(GitCommandError));
 
@@ -5146,4 +5147,89 @@ describe("Windows long path configuration", () => {
       );
     }
   });
+});
+
+describe("worktree includes", () => {
+  it.effect("copies only listed gitignored files from the repository root", () =>
+    Effect.gen(function* () {
+      const driver = yield* GitVcsDriver.GitVcsDriver;
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const cwd = yield* makeTmpDir();
+      yield* initRepoWithCommit(cwd);
+      yield* writeTextFile(cwd, ".gitignore", ".env\n.env.other\napps/web/.env.local\nREADME.md\n");
+      yield* writeTextFile(
+        cwd,
+        ".worktreeinclude",
+        ".env\napps/web/.env.local\nREADME.md\npublic.txt\n",
+      );
+      yield* git(cwd, ["add", ".gitignore", ".worktreeinclude"]);
+      yield* git(cwd, ["commit", "-m", "include patterns"]);
+      yield* writeTextFile(cwd, ".env", "root secret\n");
+      yield* writeTextFile(cwd, "apps/web/.env.local", "nested secret\n");
+      yield* writeTextFile(cwd, ".env.other", "not listed\n");
+      yield* writeTextFile(cwd, "public.txt", "not ignored\n");
+      yield* writeTextFile(cwd, "README.md", "uncommitted\n");
+      const target = path.join(yield* makeTmpDir(), "new");
+      const result = yield* driver.createWorktree({
+        cwd: path.join(cwd, "apps/web"),
+        path: target,
+        refName: "HEAD",
+        newRefName: "included",
+      });
+      assert.equal(result.worktree.path, target);
+      assert.equal(yield* fs.readFileString(path.join(target, ".env")), "root secret\n");
+      assert.equal(
+        yield* fs.readFileString(path.join(target, "apps/web/.env.local")),
+        "nested secret\n",
+      );
+      assert.equal(yield* fs.readFileString(path.join(target, "README.md")), "# test\n");
+      assert.isFalse(yield* fs.exists(path.join(target, ".env.other")));
+      assert.isFalse(yield* fs.exists(path.join(target, "public.txt")));
+    }).pipe(Effect.provide(layerTest)),
+  );
+
+  it.effect.each(["missing", "directory", "no ignored matches"] as const)(
+    "creates a worktree when the include file is %s",
+    (state) =>
+      Effect.gen(function* () {
+        const driver = yield* GitVcsDriver.GitVcsDriver;
+        const fs = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const cwd = yield* makeTmpDir();
+        yield* initRepoWithCommit(cwd);
+        yield* writeTextFile(cwd, ".gitignore", ".env\n");
+        yield* writeTextFile(cwd, ".env", "private\n");
+        if (state === "directory") yield* fs.makeDirectory(path.join(cwd, ".worktreeinclude"));
+        if (state === "no ignored matches") {
+          yield* writeTextFile(cwd, ".worktreeinclude", "public.txt\n");
+          yield* writeTextFile(cwd, "public.txt", "public\n");
+        }
+        const target = path.join(yield* makeTmpDir(), "new");
+        yield* driver.createWorktree({
+          cwd,
+          path: target,
+          refName: "HEAD",
+          newRefName: "included",
+        });
+        assert.equal(yield* fs.readFileString(path.join(target, "README.md")), "# test\n");
+        assert.isFalse(yield* fs.exists(path.join(target, ".env")));
+        assert.isFalse(yield* fs.exists(path.join(target, "public.txt")));
+      }).pipe(Effect.provide(layerTest)),
+  );
+
+  it.effect("preserves existing destinations and continues after a copy failure", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const source = yield* makeTmpDir();
+      const target = yield* makeTmpDir();
+      yield* writeTextFile(source, ".env", "source\n");
+      yield* writeTextFile(source, "nested/.env", "nested\n");
+      yield* writeTextFile(target, ".env", "keep\n");
+      yield* copyIncludedWorktreeFiles(source, target, ["missing", ".env", "nested/.env"]);
+      assert.equal(yield* fs.readFileString(path.join(target, ".env")), "keep\n");
+      assert.equal(yield* fs.readFileString(path.join(target, "nested/.env")), "nested\n");
+    }).pipe(Effect.provide(NodeServices.layer)),
+  );
 });
