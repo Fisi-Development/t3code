@@ -68,6 +68,16 @@ describe("delegate worktree commit", () => {
         assert.isFalse(yield* restored.available(ThreadId.make("non-delegate")));
       }).pipe(Effect.scoped, Effect.provide(layer)),
   );
+  it.effect("refuses a child branch redirected to main without moving main", () =>
+    Effect.gen(function* () {
+      const f = yield* fixture;
+      const before = yield* f.git(f.repo, "rev-parse", "main");
+      yield* f.git(f.child, "symbolic-ref", `refs/heads/${f.branch}`, "refs/heads/main");
+      const failure = yield* Effect.flip(f.service.commit(f.threadId, { message: "must refuse" }));
+      assert.include(failure.message, "redirects to another ref");
+      assert.equal(yield* f.git(f.repo, "rev-parse", "main"), before);
+    }).pipe(Effect.scoped, Effect.provide(layer)),
+  );
   it.effect("stages only literal selected paths and rejects paths outside the checkout", () =>
     Effect.gen(function* () {
       const f = yield* fixture;

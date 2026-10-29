@@ -238,14 +238,17 @@ it.effect("production mcp layer lists worktree tools over http", () =>
       }
     }),
   ).pipe(
-    Effect.provide(DelegateWorktreeCommit.layer),
     Effect.provide(
-      Layer.mergeAll(
-        NodeHttpServer.layerTest,
-        ServerConfig.layerTest(process.cwd(), { prefix: "t3-worktree-mcp-" }).pipe(
-          Layer.provide(NodeServices.layer),
+      DelegateWorktreeCommit.layer.pipe(
+        Layer.provideMerge(
+          Layer.mergeAll(
+            NodeHttpServer.layerTest,
+            ServerConfig.layerTest(process.cwd(), { prefix: "t3-worktree-mcp-" }).pipe(
+              Layer.provide(NodeServices.layer),
+            ),
+            NodeServices.layer,
+          ),
         ),
-        NodeServices.layer,
       ),
     ),
   ),

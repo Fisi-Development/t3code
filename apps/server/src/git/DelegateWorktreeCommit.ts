@@ -189,6 +189,8 @@ const make = Effect.gen(function* () {
             return stdout.trim();
           });
         const ref = `refs/heads/${authority.branch}`;
+        if ((yield* git(["rev-parse", "--symbolic-full-name", ref])) !== ref)
+          return yield* refuse("Refused: the recorded child branch redirects to another ref.");
         const parent = yield* git(["rev-parse", "--verify", ref]);
         // A child can select a configured clean filter via .gitattributes; disable those callbacks too.
         const filters = yield* git(["config", "--name-only", "--list"]);
@@ -208,7 +210,15 @@ const make = Effect.gen(function* () {
         const commitSha = yield* git(["commit-tree", tree, "-p", parent, "-F", "-"], input.message);
         yield* validate(authority);
         // Never update HEAD implicitly: even a concurrent checkout cannot move another branch.
-        yield* git(["update-ref", "-m", "t3 worktree commit", ref, commitSha, parent]);
+        yield* git([
+          "update-ref",
+          "--no-deref",
+          "-m",
+          "t3 worktree commit",
+          ref,
+          commitSha,
+          parent,
+        ]);
         return { commitSha };
       }).pipe(
         Effect.scoped,
