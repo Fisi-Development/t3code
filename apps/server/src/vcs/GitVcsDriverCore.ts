@@ -37,6 +37,7 @@ import { parseT3ProjectFile } from "@t3tools/shared/t3ProjectFile";
 import { resolveProjectFileBackedSetting } from "@t3tools/shared/projectSettings";
 import { gitCommandDuration, gitCommandsTotal, withMetrics } from "../observability/Metrics.ts";
 import * as GitVcsDriver from "./GitVcsDriver.ts";
+import { copyIncludedWorktreeFiles } from "./worktreeInclude.ts";
 import { explicitBareRepositoryEnv, gitConfigEnv } from "./VcsProcess.ts";
 import { resolveWorktreesDirectory } from "../worktreesDirectory.ts";
 import {
@@ -3572,6 +3573,44 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
           : {}),
       },
     );
+
+    yield* Effect.gen(function* () {
+      const root = (yield* runGitStdout("GitVcsDriver.createWorktree.includeRoot", input.cwd, [
+        "rev-parse",
+        "--show-toplevel",
+      ])).trim();
+      const includeFile = path.join(root, ".worktreeinclude");
+      if (!(yield* fileSystem.exists(includeFile))) return;
+      if ((yield* fileSystem.stat(includeFile)).type !== "File") return;
+      const candidates = splitNullSeparatedGitStdoutPaths(
+        yield* executeGit(
+          "GitVcsDriver.createWorktree.includeCandidates",
+          root,
+          ["ls-files", "-z", "--others", "--ignored", `--exclude-from=${includeFile}`],
+          { maxOutputBytes: REVIEW_METADATA_MAX_OUTPUT_BYTES },
+        ),
+      );
+      if (candidates.length === 0) return;
+      const ignored = yield* executeGit(
+        "GitVcsDriver.createWorktree.includeIgnored",
+        root,
+        ["check-ignore", "-z", "--stdin"],
+        {
+          stdin: `${candidates.join("\0")}\0`,
+          allowNonZeroExit: true,
+          maxOutputBytes: REVIEW_METADATA_MAX_OUTPUT_BYTES,
+        },
+      );
+      if (ignored.exitCode === 1) return;
+      if (ignored.exitCode !== 0) {
+        return yield* Effect.logWarning("worktree include ignore check failed");
+      }
+      yield* copyIncludedWorktreeFiles(
+        root,
+        worktreePath,
+        splitNullSeparatedGitStdoutPaths(ignored),
+      ).pipe(Effect.provideService(Path.Path, path));
+    }).pipe(Effect.catch(() => Effect.logWarning("worktree include copy failed")));
 
     if (progress?.onWorktreeClaimed) {
       yield* progress.onWorktreeClaimed(worktreePath);
