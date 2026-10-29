@@ -1,3 +1,4 @@
+import * as ResourceCleanupService from "./ResourceCleanupService.ts";
 import { assert, it } from "@effect/vitest";
 import {
   CheckpointId,
@@ -979,4 +980,33 @@ it.effect.each(["confirmed", "unconfirmed", "failed"] as const)(
         outcome === "confirmed" ? ["stop-child", "settle-child"] : ["stop-child"],
       );
     }),
+);
+
+it.effect("executes delegated worktree authority cleanup for thread deletion", () =>
+  Effect.gen(function* () {
+    const events = yield* Ref.make<ReadonlyArray<string>>([]);
+    const cleanup = yield* ResourceCleanupService.ResourceCleanupService;
+    const now = yield* DateTime.now;
+    const effect = {
+      ...restartEffect(now, { type: "detach" }),
+      request: { type: "worktree-commit.cleanup" as const },
+    };
+    yield* Effect.gen(function* () {
+      const executor = yield* EffectWorker.OrchestrationEffectExecutorV2;
+      yield* executor.execute(effect);
+    }).pipe(
+      Effect.provide(
+        layerExecutorFor({ events }).pipe(
+          Layer.provide(
+            Layer.succeed(ResourceCleanupService.ResourceCleanupService, {
+              ...cleanup,
+              cleanupWorktreeCommit: (id) =>
+                Ref.update(events, (items) => [...items, `forget:${id}`]),
+            }),
+          ),
+        ),
+      ),
+    );
+    assert.deepEqual(yield* Ref.get(events), [`forget:${effect.threadId}`]);
+  }),
 );

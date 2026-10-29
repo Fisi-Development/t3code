@@ -473,6 +473,19 @@ export const layerExecutor: Layer.Layer<
                   }),
               ),
             );
+          case "worktree-commit.cleanup":
+            return resourceCleanup
+              .cleanupWorktreeCommit(effect.threadId)
+              .pipe(
+                Effect.mapError(
+                  (cause) =>
+                    new OrchestrationEffectExecutionError({
+                      effectId: effect.id,
+                      effectType: effect.request.type,
+                      cause,
+                    }),
+                ),
+              );
           case "preview.cleanup":
             return resourceCleanup.cleanupPreviews(effect.threadId).pipe(
               Effect.mapError(

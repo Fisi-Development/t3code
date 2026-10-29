@@ -45,6 +45,7 @@ export const clientRuntimeModeCeiling = (client: McpClientCaller | undefined): R
  * preview, worktree handoff) need `thread`.
  */
 export interface McpInvocationScope {
+  readonly delegateWorktreeCommit?: boolean;
   readonly environmentId: EnvironmentId;
   readonly capabilities: ReadonlySet<McpCapability>;
   readonly issuedAt: number;

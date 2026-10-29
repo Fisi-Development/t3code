@@ -1,3 +1,4 @@
+import * as DelegateWorktreeCommit from "../git/DelegateWorktreeCommit.ts";
 import { ThreadId } from "@t3tools/contracts";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
@@ -13,7 +14,7 @@ import * as TerminalManager from "../terminal/Manager.ts";
 export class ResourceCleanupError extends Schema.TaggedError<ResourceCleanupError>()(
   "ResourceCleanupError",
   {
-    operation: Schema.Literals(["terminal", "preview", "attachment"]),
+    operation: Schema.Literals(["terminal", "preview", "attachment", "worktree-commit"]),
     threadId: Schema.optional(Schema.String),
     attachmentId: Schema.optional(Schema.String),
     cause: Schema.Defect(),
@@ -21,6 +22,7 @@ export class ResourceCleanupError extends Schema.TaggedError<ResourceCleanupErro
 ) {}
 
 export class ResourceCleanupService extends Context.Reference<{
+  readonly cleanupWorktreeCommit: (threadId: string) => Effect.Effect<void, ResourceCleanupError>;
   readonly cleanupTerminals: (threadId: string) => Effect.Effect<void, ResourceCleanupError>;
   readonly cleanupPreviews: (threadId: string) => Effect.Effect<void, ResourceCleanupError>;
   readonly cleanupAttachments: (
@@ -28,6 +30,7 @@ export class ResourceCleanupService extends Context.Reference<{
   ) => Effect.Effect<void, ResourceCleanupError>;
 }>("t3/orchestration-v2/ResourceCleanupService", {
   defaultValue: () => ({
+    cleanupWorktreeCommit: () => Effect.void,
     cleanupTerminals: () => Effect.void,
     cleanupPreviews: () => Effect.void,
     cleanupAttachments: () => Effect.void,
@@ -37,11 +40,21 @@ export class ResourceCleanupService extends Context.Reference<{
 export const layer = Layer.effect(
   ResourceCleanupService,
   Effect.gen(function* () {
+    const commits = yield* DelegateWorktreeCommit.DelegateWorktreeCommit;
     const terminals = yield* TerminalManager.TerminalManager;
     const previews = yield* PreviewManager.PreviewManager;
     const fileSystem = yield* FileSystem.FileSystem;
     const config = yield* ServerConfig.ServerConfig;
     return {
+      cleanupWorktreeCommit: (threadId: string) =>
+        commits
+          .forget(ThreadId.make(threadId))
+          .pipe(
+            Effect.mapError(
+              (cause) =>
+                new ResourceCleanupError({ operation: "worktree-commit", threadId, cause }),
+            ),
+          ),
       cleanupTerminals: (threadId: string) =>
         terminals
           .close({ threadId, deleteHistory: true })
@@ -81,4 +94,4 @@ export const layer = Layer.effect(
         ),
     };
   }),
-);
+).pipe(Layer.provide(DelegateWorktreeCommit.layer));
