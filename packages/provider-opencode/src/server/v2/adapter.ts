@@ -274,6 +274,7 @@ interface ThreadState {
    * so the next execution end belongs to that run; it clears this and ends no turn.
    */
   unsettled: boolean;
+  retiring: boolean;
   /**
    * A prompt whose request failed may start its run late; that start is the
    * run's own, and only a start after it means its end was lost.
@@ -763,6 +764,7 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
       active: undefined,
       model: undefined,
       unsettled: false,
+      retiring: false,
       unsettledStarted: false,
       directory,
       agent: "build",
@@ -2109,6 +2111,7 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
     });
 
     const onWake = Effect.fnUntraced(function* (state: ThreadState) {
+      if (rootOf(state).retiring) return;
       const { delivered, stopped } = yield* takeReports(state);
       if (stopped) return;
       const route = state.providerThread.appThreadId;
@@ -3466,6 +3469,12 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
                   detail: `OpenCode session ${sessionId} is not registered`,
                 });
               }
+              if (rootOf(state).retiring) {
+                return yield* new ProviderAdapter.ProviderAdapterProtocolError({
+                  driver: OPENCODE_PROVIDER,
+                  detail: "The OpenCode conversation is being retired",
+                });
+              }
               if (state.active !== undefined) {
                 return yield* new ProviderAdapter.ProviderAdapterProtocolError({
                   driver: OPENCODE_PROVIDER,
@@ -3729,10 +3738,56 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
                 }),
           ),
         ),
-      unloadThread: ({ providerThread }) =>
+      unloadThread: ({ providerThread, reason }) =>
         Effect.gen(function* () {
           const nativeId = providerThread.nativeThreadRef?.nativeId;
           const state = nativeId == null ? undefined : threads.get(nativeId);
+          if (state !== undefined && reason === "detach") {
+            state.retiring = true;
+            // A completed turn can still own native background executions. Idle
+            // eviction preserves them; explicit detach retires this conversation.
+            const owned = sessionsOf(state);
+            const nativeIds = new Set(owned.map((session) => session.sessionId));
+            for (let previousSize = -1; previousSize !== nativeIds.size;) {
+              previousSize = nativeIds.size;
+              for (const [childId, info] of announced) {
+                if (info.parentID !== undefined && nativeIds.has(info.parentID))
+                  nativeIds.add(childId);
+              }
+            }
+            for (const [childId, caller] of strays) {
+              if (rootOf(caller) === state) nativeIds.add(childId);
+            }
+            yield* Effect.forEach(
+              nativeIds,
+              (sessionId) =>
+                client.session
+                  .interrupt({ sessionID: Session.ID.make(sessionId) })
+                  .pipe(
+                    Effect.catchTags({ SessionNotFoundError: () => Effect.void }),
+                    Effect.timeout(INTERRUPT_TIMEOUT),
+                  ),
+              { discard: true },
+            );
+            yield* lock.withPermit(
+              Effect.gen(function* () {
+                for (const call of runningCalls(state)) {
+                  if (isOrchestrationV2WorkActive(call.status))
+                    yield* settleCall(call, "interrupted");
+                }
+                for (const session of owned) {
+                  busy.delete(session.sessionId);
+                  discardWakes(session, session.wakes.splice(0));
+                  session.reports.clear();
+                }
+                if (state.active !== undefined) yield* finishTurn(state, { status: "interrupted" });
+                for (const sessionId of nativeIds) {
+                  announced.delete(sessionId);
+                  strays.delete(sessionId);
+                }
+              }),
+            );
+          }
           if (
             nativeId == null ||
             state === undefined ||
@@ -3748,7 +3803,17 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
             threads.delete(child);
           }
           if (state.mcp !== undefined) yield* removeMcp(state.mcp);
-        }),
+        }).pipe(
+          Effect.mapError((cause) =>
+            isProviderAdapterError(cause)
+              ? cause
+              : new ProviderAdapter.ProviderAdapterProtocolError({
+                  driver,
+                  detail: "Failed to retire the detached OpenCode conversation",
+                  cause,
+                }),
+          ),
+        ),
       respondToRuntimeRequest: (requestInput) =>
         Effect.gen(function* () {
           const entry = pending.get(requestInput.requestId);

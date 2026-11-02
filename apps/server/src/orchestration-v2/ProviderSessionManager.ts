@@ -2428,37 +2428,41 @@ export const layerWithOptions = (
               // Serialized with re-attachment: a thread whose next turn
               // attaches first stays loaded, and one that attaches during the
               // unload waits for it, so its resume reloads the native thread.
-              yield* threadAttachment.withLock(
-                threadAttachmentKey(input),
-                Effect.gen(function* () {
-                  const entry = (yield* Ref.get(sessions)).get(key);
-                  if (
-                    entry?.runtime !== detached.value.runtime ||
-                    entry.attachedThreadIds.has(input.threadId)
-                  ) {
-                    return;
-                  }
-                  yield* Effect.forEach(
-                    detachedProviderThreads.filter((thread) => thread.nativeThreadRef !== null),
-                    (providerThread) =>
-                      unloadThread({ providerThread }).pipe(
-                        Effect.timeout(UNLOAD_THREAD_TIMEOUT_MS),
-                        Effect.catchCause((cause) =>
-                          Effect.logWarning(
-                            "orchestration-v2.driver-session.detach-unload-failed",
-                            {
-                              providerSessionId: input.providerSessionId,
-                              threadId: input.threadId,
-                              providerThreadId: providerThread.id,
-                              cause,
-                            },
-                          ),
+              yield* threadAttachment
+                .withLock(
+                  threadAttachmentKey(input),
+                  Effect.gen(function* () {
+                    const entry = (yield* Ref.get(sessions)).get(key);
+                    if (
+                      entry?.runtime !== detached.value.runtime ||
+                      entry.attachedThreadIds.has(input.threadId)
+                    ) {
+                      return;
+                    }
+                    yield* Effect.forEach(
+                      detachedProviderThreads.filter((thread) => thread.nativeThreadRef !== null),
+                      (providerThread) =>
+                        unloadThread({ providerThread, reason: "detach" }).pipe(
+                          Effect.timeout(UNLOAD_THREAD_TIMEOUT_MS),
                         ),
-                      ),
-                    { concurrency: 1, discard: true },
-                  );
-                }),
-              );
+                      { concurrency: 1, discard: true },
+                    );
+                  }),
+                )
+                .pipe(
+                  Effect.onError(() =>
+                    Ref.update(sessions, (current) => {
+                      const entry = current.get(key);
+                      if (entry?.runtime !== detached.value.runtime) return current;
+                      const updated = new Map(current);
+                      updated.set(key, {
+                        ...entry,
+                        attachedThreadIds: new Set([...entry.attachedThreadIds, input.threadId]),
+                      });
+                      return updated;
+                    }),
+                  ),
+                );
             }
             yield* scheduleIdleRelease(input.providerSessionId);
           }).pipe(
