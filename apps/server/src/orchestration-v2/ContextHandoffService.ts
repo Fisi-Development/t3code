@@ -1,6 +1,7 @@
 import {
   OrchestrationV2ContextHandoff,
   type OrchestrationV2TurnItem,
+  type OrchestrationV2ProviderThread,
   type OrchestrationV2Run,
   ProviderInstanceId,
   ProviderThreadId,
@@ -79,6 +80,7 @@ export interface ContextHandoffServiceV2Shape {
     readonly toProviderInstanceId: ProviderInstanceId;
     readonly coveredRunOrdinals: OrchestrationV2ContextHandoff["coveredRunOrdinals"];
     readonly runs?: ReadonlyArray<OrchestrationV2Run>;
+    readonly sourceProviderThreads: ReadonlyArray<OrchestrationV2ProviderThread>;
     readonly strategy: Extract<
       OrchestrationV2ContextHandoff["strategy"],
       "delta_since_target_last_seen" | "full_thread_summary"
@@ -419,6 +421,7 @@ const makeContextHandoffService = Effect.fn("orchestrationV2.ContextHandoffServi
       readonly toProviderInstanceId: ProviderInstanceId;
       readonly coveredRunOrdinals: OrchestrationV2ContextHandoff["coveredRunOrdinals"];
       readonly runs?: ReadonlyArray<OrchestrationV2Run>;
+      readonly sourceProviderThreads: ReadonlyArray<OrchestrationV2ProviderThread>;
       readonly strategy: Extract<
         OrchestrationV2ContextHandoff["strategy"],
         "delta_since_target_last_seen" | "full_thread_summary"
@@ -444,6 +447,18 @@ const makeContextHandoffService = Effect.fn("orchestrationV2.ContextHandoffServi
               }),
           ),
         );
+      const goalControllers = input.sourceProviderThreads.flatMap((source) =>
+        source.goal != null && source.goal.status !== "complete"
+          ? [
+              {
+                providerThreadId: source.id,
+                nativeThreadRef: source.nativeThreadRef,
+                goal: source.goal,
+                observedAt: source.updatedAt,
+              },
+            ]
+          : [],
+      );
       const runStatuses = new Map(input.runs?.map((run) => [run.id, run.status]));
       const coverage = handoffCoverage(input);
       const selected = selectHistory({
@@ -473,6 +488,7 @@ const makeContextHandoffService = Effect.fn("orchestrationV2.ContextHandoffServi
         status: "ready",
         summaryMessageId: null,
         summaryText: renderHistory(selected.messages, selected.context),
+        ...(goalControllers.length === 0 ? {} : { goalControllers }),
         history: {
           messages: selected.messages,
           coverage,

@@ -1536,6 +1536,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           ? null
           : yield* contextHandoffService
               .prepareProviderHandoff({
+                sourceProviderThreads: projection.providerThreads,
                 threadId,
                 targetRunId: queuedRun.id,
                 transferId,
@@ -4337,6 +4338,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         );
         restartHandoff = yield* contextHandoffService
           .prepareProviderHandoff({
+            sourceProviderThreads: input.projection.providerThreads,
             threadId: input.command.threadId,
             targetRunId: targetRun.id,
             transferId,
@@ -5975,6 +5977,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           ? null
           : yield* contextHandoffService
               .prepareProviderHandoff({
+                sourceProviderThreads: sourceProjection.providerThreads,
                 threadId: command.threadId,
                 targetRunId: runId,
                 transferId: pendingForkTransfer.id,
@@ -6059,6 +6062,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           ? null
           : yield* contextHandoffService
               .prepareProviderHandoff({
+                sourceProviderThreads: projection.providerThreads,
                 threadId: command.threadId,
                 targetRunId: runId,
                 transferId: providerSwitchTransferId,

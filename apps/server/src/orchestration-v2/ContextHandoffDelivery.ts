@@ -1,6 +1,7 @@
-import type {
-  OrchestrationV2ContextHandoff,
-  OrchestrationV2ProviderThread,
+import {
+  OrchestrationV2GoalControllerSnapshot,
+  type OrchestrationV2ContextHandoff,
+  type OrchestrationV2ProviderThread,
 } from "@t3tools/contracts";
 import type * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
 import { ContextHandoffBudgetError } from "@t3tools/provider-core/server/failure";
@@ -11,6 +12,10 @@ import {
   renderHistory,
   selectHistory,
 } from "@t3tools/provider-core/server/handoffBudget";
+
+const encodeGoalControllers = Schema.encodeSync(
+  Schema.fromJsonString(Schema.Array(OrchestrationV2GoalControllerSnapshot)),
+);
 
 /**
  * Persist before/after injection: an ambiguous pending delivery requires a fresh native thread.
@@ -52,6 +57,17 @@ export const deliverContextHandoffs = Effect.fn("orchestrationV2.deliverContextH
       const strategies = Array.from(new Set(pending.map((handoff) => handoff.strategy)));
       coverage = `Context handoff (${strategies.join(", ")}). ${pending.length} handoff records; detailed coverage references omitted. Recover history with t3_thread_read({threadId:"${input.providerThread.appThreadId ?? pending[0]!.threadId}",view:"activity",limit:20,maxCharsPerItem:4000}); paginate with afterPosition=nextPosition. Follow fork/handoff source references in activity. For long items use itemId and textOffset=nextTextOffset until null.`;
     }
+    const goalControllers = pending.flatMap((handoff) => handoff.goalControllers ?? []);
+    // Keep controller provenance outside history selection and coverage compaction.
+    // A snapshot cannot authorize a second native goal or claim the old one stopped.
+    const goalContext =
+      goalControllers.length === 0
+        ? ""
+        : `Historical goal controllers (source: persisted provider-thread projection; not authorization to create or activate a successor goal). Native goal identity and accounting stay with the named owner. Reconcile old-controller retirement before continuing; these snapshots do not prove retirement.\n${encodeGoalControllers(goalControllers)}`;
+    if (goalContext && historyCost([], `${coverage}\n${goalContext}`) > budget) {
+      return yield* new ContextHandoffBudgetError();
+    }
+    if (goalContext) coverage = `${coverage}\n${goalContext}`;
     const seen = new Set(input.alreadyDeliveredItemIds);
     const messages = pending
       .flatMap((handoff) => handoff.history?.messages ?? [])
@@ -74,6 +90,9 @@ export const deliverContextHandoffs = Effect.fn("orchestrationV2.deliverContextH
       omittedItems: pending.reduce((sum, handoff) => sum + (handoff.history?.omittedItems ?? 0), 0),
       budget,
     });
+    if (goalContext && !selected.context.includes(goalContext)) {
+      return yield* new ContextHandoffBudgetError();
+    }
     if (historyCost(selected.messages, selected.context) > budget) {
       if (input.deferInline) return { context: "", delivered: Effect.void, unsent: Effect.void };
       return yield* new ContextHandoffBudgetError();

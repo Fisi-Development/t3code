@@ -906,6 +906,13 @@ export const OrchestrationV2HistoricalMessage = Schema.Struct({
 });
 export type OrchestrationV2HistoricalMessage = typeof OrchestrationV2HistoricalMessage.Type;
 
+export const OrchestrationV2GoalControllerSnapshot = Schema.Struct({
+  providerThreadId: ProviderThreadId,
+  nativeThreadRef: Schema.NullOr(OrchestrationV2ProviderRef),
+  goal: OrchestrationV2ProviderGoal,
+  observedAt: Schema.DateTimeUtc,
+});
+
 export const OrchestrationV2ContextHandoff = Schema.Struct({
   id: ContextHandoffId,
   transferId: Schema.optional(Schema.NullOr(ContextTransferId)),
@@ -927,6 +934,7 @@ export const OrchestrationV2ContextHandoff = Schema.Struct({
   status: Schema.Literals(["pending", "ready", "failed", "superseded"]),
   summaryMessageId: Schema.NullOr(MessageId),
   summaryText: Schema.String,
+  goalControllers: Schema.optional(Schema.Array(OrchestrationV2GoalControllerSnapshot)),
   history: Schema.optional(
     Schema.Struct({
       messages: Schema.Array(OrchestrationV2HistoricalMessage),

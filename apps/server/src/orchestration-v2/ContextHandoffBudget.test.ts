@@ -16,6 +16,9 @@ import {
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
+import * as Layer from "effect/Layer";
+import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
+import * as ContextHandoffService from "./ContextHandoffService.ts";
 import {
   contextUsageForHandoff,
   handoffBudget,
@@ -409,6 +412,144 @@ describe("handoff budget", () => {
       );
     }
   });
+});
+
+describe("goal ownership handoff", () => {
+  it.effect("retains earlier unfinished controllers across a second provider handoff", () =>
+    Effect.gen(function* () {
+      const service = yield* ContextHandoffService.ContextHandoffServiceV2;
+      const source = {
+        ...providerThread,
+        id: ProviderThreadId.make("source-controller"),
+        goal: { objective: "Original objective", status: "paused" as const, tokensUsed: 123 },
+      };
+      const prepare = (sourceProviderThreads: ReadonlyArray<OrchestrationV2ProviderThread>) =>
+        service.prepareProviderHandoff({
+          threadId,
+          targetRunId: handoff.targetRunId,
+          transferId: null,
+          fromProviderThreadIds: [ProviderThreadId.make("intermediate-provider")],
+          toProviderThreadId: providerThread.id,
+          fromProviderInstanceId: source.providerInstanceId,
+          toProviderInstanceId: providerThread.providerInstanceId,
+          coveredRunOrdinals: { from: 1, to: 2 },
+          strategy: "full_thread_summary",
+          items: [],
+          createdAt: now,
+          sourceProviderThreads,
+        });
+      const result = yield* prepare([
+        source,
+        { ...source, id: providerThread.id, goal: { ...source.goal, status: "complete" } },
+      ]);
+      assert.deepEqual(result.goalControllers, [
+        {
+          providerThreadId: source.id,
+          nativeThreadRef: source.nativeThreadRef,
+          goal: source.goal,
+          observedAt: source.updatedAt,
+        },
+      ]);
+      assert.equal(source.goal.status, "paused");
+      assert.isUndefined(
+        (yield* prepare([{ ...source, goal: { ...source.goal, status: "complete" } }]))
+          .goalControllers,
+      );
+    }).pipe(Effect.provide(ContextHandoffService.layer.pipe(Layer.provide(IdAllocator.layer)))),
+  );
+  it.effect("rejects a budget that cannot carry ownership before injection or persistence", () =>
+    Effect.gen(function* () {
+      let touched = false;
+      const result = yield* deliverContextHandoffs({
+        handoffs: [
+          {
+            ...handoff,
+            goalControllers: [
+              {
+                providerThreadId: providerThread.id,
+                nativeThreadRef: providerThread.nativeThreadRef,
+                goal: { objective: "x".repeat(8000), status: "active" },
+                observedAt: now,
+              },
+            ],
+          },
+        ],
+        providerThread,
+        budget: 200,
+        alreadyDeliveredItemIds: new Set(),
+        inject: () => {
+          touched = true;
+          return Effect.succeed(true);
+        },
+        persist: () => {
+          touched = true;
+          return Effect.void;
+        },
+      }).pipe(Effect.result);
+      assert.equal(result._tag, "Failure");
+      assert.isFalse(touched);
+    }),
+  );
+  it.effect("propagates provider injection failure with ownership present", () =>
+    Effect.gen(function* () {
+      const failure = new Error("provider rejected handoff");
+      const result = yield* deliverContextHandoffs({
+        handoffs: [
+          {
+            ...handoff,
+            goalControllers: [
+              {
+                providerThreadId: providerThread.id,
+                nativeThreadRef: providerThread.nativeThreadRef,
+                goal: { objective: "Finish", status: "active" },
+                observedAt: now,
+              },
+            ],
+          },
+        ],
+        providerThread,
+        budget: 16000,
+        alreadyDeliveredItemIds: new Set(),
+        inject: () => Effect.fail(failure),
+        persist: () => Effect.void,
+      }).pipe(Effect.result);
+      assert.equal(result._tag, "Failure");
+      if (result._tag === "Failure") assert.equal(result.failure, failure);
+    }),
+  );
+
+  it.effect("retains native owner and accounting through delivery without activating a goal", () =>
+    Effect.gen(function* () {
+      const ownership = {
+        providerThreadId: ProviderThreadId.make("provider-thread:old-controller"),
+        nativeThreadRef: {
+          driver: ProviderDriverKind.make("codex"),
+          strength: "strong" as const,
+          nativeId: "old-native-goal",
+        },
+        goal: {
+          objective: "Finish the original work",
+          status: "active" as const,
+          tokensUsed: 123,
+          tokenBudget: 456,
+        },
+        observedAt: now,
+      };
+      const durable = decodeHandoff({ ...handoff, goalControllers: [ownership] });
+      assert.deepEqual(durable.goalControllers, [ownership]);
+      const result = yield* deliverContextHandoffs({
+        handoffs: [durable],
+        providerThread,
+        budget: 16_000,
+        alreadyDeliveredItemIds: new Set(),
+        persist: () => Effect.void,
+      });
+      assert.include(result.context, "old-native-goal");
+      assert.include(result.context, '"tokensUsed":123');
+      assert.include(result.context, "not authorization");
+      assert.notInclude(result.context, "Goal transferred");
+    }),
+  );
 });
 
 describe("handoff delivery", () => {
