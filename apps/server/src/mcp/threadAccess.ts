@@ -10,6 +10,7 @@ import {
 } from "@t3tools/contracts";
 import * as Crypto from "effect/Crypto";
 import * as Effect from "effect/Effect";
+import * as Schema from "effect/Schema";
 
 import type { OrchestratorV2Error } from "../orchestration-v2/Orchestrator.ts";
 import * as ThreadManagement from "../orchestration-v2/ThreadManagementService.ts";
@@ -102,23 +103,56 @@ export const assertTargetWithinLimits = (
     Effect.asVoid,
   );
 
+const encodeCallerContext = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown));
+
 /**
  * A thread caller acts only while it owns a live run, or a background
  * subagent that run started, of a thread that is not archived, so a provider
  * token that outlived its session cannot act. An OAuth client has no run; its
  * session and ceiling are its authority.
  */
-export function assertLiveCaller({ caller, scope }: Caller) {
-  if (caller === undefined) return Effect.void;
-  return OrchestrationMcp.isLiveCallerShell(caller, scope.thread?.providerInstanceId)
-    ? Effect.void
-    : Effect.fail(
-        new OrchestratorMcpFailure({
-          code: "parent_not_active",
-          message: "The calling provider no longer owns an active thread run.",
-        }),
-      );
-}
+export const assertLiveCaller = Effect.fn("mcp.assertLiveCaller")(function* ({
+  caller,
+  scope,
+  threads,
+}: Caller) {
+  if (caller === undefined) return;
+  if (OrchestrationMcp.isLiveCallerShell(caller, scope.thread?.providerInstanceId)) return;
+
+  // Keep the denying snapshot distinct from this later diagnostic read.
+  const records =
+    caller.activeRunId === null
+      ? null
+      : yield* threads
+          .getThreadRecords(caller.id, ["runs"], {
+            runIds: [caller.activeRunId],
+          })
+          .pipe(Effect.catchCause(() => Effect.succeed(null)));
+  const run = records?.runs.find((candidate) => candidate.id === caller.activeRunId);
+  const boundedId = (value: string | null | undefined) => value?.slice(0, 512) ?? null;
+  const context = {
+    gate: "threadAccess.assertLiveCaller",
+    callerProviderInstanceId: boundedId(scope.thread?.providerInstanceId),
+    callerMcpProviderSessionId: boundedId(scope.thread?.providerSessionId),
+    observedProviderInstanceId: boundedId(caller.providerInstanceId),
+    observedActiveRunId: boundedId(caller.activeRunId),
+    observedArchived: caller.archivedAt !== null,
+    observedOwnedBackgroundSubagent:
+      caller.pendingBackgroundTasks?.some(
+        (task) =>
+          task.kind === "subagent" && task.providerInstanceId === scope.thread?.providerInstanceId,
+      ) ?? false,
+    diagnosticRunRead:
+      caller.activeRunId === null ? "not_needed" : records === null ? "failed" : "later_snapshot",
+    diagnosticRunStatus: run?.status ?? null,
+    diagnosticRunProviderInstanceId: boundedId(run?.providerInstanceId),
+    diagnosticRunRootNodePresent: run === undefined ? null : run.rootNodeId !== null,
+  };
+  return yield* new OrchestratorMcpFailure({
+    code: "parent_not_active",
+    message: `The calling provider no longer owns an active thread run. Context: ${encodeCallerContext(context)}`,
+  });
+});
 
 export const assertFullAccess = (context: Caller, message: string) =>
   context.limits.runtimeMode === "full-access" && context.limits.interactionMode === "default"
