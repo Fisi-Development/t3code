@@ -1310,9 +1310,54 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       if (usageLimitBlockedRun(projection.runs, projection.turnItems, sessionError) !== null) {
         return;
       }
-      const queuedRun = nextQueuedRun(projection);
+      let queuedRun = nextQueuedRun(projection);
       if (queuedRun === undefined) {
         return;
+      }
+      const queuedMessageId = queuedRun.userMessageId;
+      const queuedMessage = projection.messages.find(
+        (candidate) => candidate.id === queuedMessageId,
+      );
+      // A captured default is not a per-request override. Legacy queued runs
+      // have no provenance, so only a recorded override can restore that route.
+      const followCurrentSelection =
+        queuedRun.modelSelectionSource !== "request" &&
+        !modelSelectionsEqual(queuedRun.modelSelection, projection.thread.modelSelection);
+      let retargetedProviderThread: OrchestrationV2ProviderThread | undefined;
+      if (followCurrentSelection) {
+        const selection = projection.thread.modelSelection;
+        const adapter = yield* providerAdapters.get(selection.instanceId);
+        const now = yield* DateTime.now;
+        retargetedProviderThread = rootProviderThreadsForProvider(
+          projection,
+          selection.instanceId,
+        )[0] ?? {
+          id: idAllocator.derive.providerThread({
+            driver: adapter.driver,
+            providerInstanceId: selection.instanceId,
+            nativeThreadId: `pending:${queuedRun.id}`,
+          }),
+          driver: adapter.driver,
+          providerInstanceId: selection.instanceId,
+          providerSessionId: null,
+          appThreadId: threadId,
+          ownerNodeId: null,
+          nativeThreadRef: null,
+          nativeConversationHeadRef: null,
+          status: "not_loaded",
+          firstRunOrdinal: null,
+          lastRunOrdinal: null,
+          handoffIds: [],
+          forkedFrom: null,
+          createdAt: now,
+          updatedAt: now,
+        };
+        queuedRun = {
+          ...queuedRun,
+          providerInstanceId: selection.instanceId,
+          modelSelection: selection,
+          providerThreadId: retargetedProviderThread.id,
+        };
       }
       // A message queued behind a worktree that was cancelled or never created
       // would run in the project checkout instead, so it waits for the user.
@@ -1388,11 +1433,12 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         });
       }
 
-      const rootNode = projection.nodes.find((candidate) => candidate.id === rootNodeId);
+      const storedRootNode = projection.nodes.find((candidate) => candidate.id === rootNodeId);
+      const rootNode =
+        storedRootNode === undefined || retargetedProviderThread === undefined
+          ? storedRootNode
+          : { ...storedRootNode, providerThreadId: retargetedProviderThread.id };
       const attempt = projection.attempts.find((candidate) => candidate.id === attemptId);
-      const queuedMessage = projection.messages.find(
-        (candidate) => candidate.id === queuedRun.userMessageId,
-      );
       const legacyQueuedTurnItem = projection.turnItems.find(
         (
           candidate,
@@ -1401,18 +1447,20 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           candidate.runId === queuedRun.id &&
           candidate.messageId === queuedRun.userMessageId,
       );
-      const queuedProviderThread = projection.providerThreads.find(
-        (candidate) => candidate.id === providerThreadId,
-      );
-      const storedCheckpointScope = projection.checkpointScopes.find(
-        (scope) => scope.id === rootNode?.checkpointScopeId,
-      );
+      const queuedProviderThread =
+        retargetedProviderThread ??
+        projection.providerThreads.find((candidate) => candidate.id === providerThreadId);
+      const storedCheckpointScope = followCurrentSelection
+        ? undefined
+        : projection.checkpointScopes.find((scope) => scope.id === rootNode?.checkpointScopeId);
       if (
         rootNode === undefined ||
         attempt === undefined ||
         queuedMessage === undefined ||
         queuedProviderThread === undefined ||
-        (rootNode.checkpointScopeId !== null && storedCheckpointScope === undefined)
+        (!followCurrentSelection &&
+          rootNode.checkpointScopeId !== null &&
+          storedCheckpointScope === undefined)
       ) {
         return yield* new OrchestratorDispatchError({
           commandId: CommandId.make(`command:system:start-queued:${queuedRun.id}`),
@@ -1478,6 +1526,14 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
             }),
         ),
       );
+      if (followCurrentSelection) {
+        yield* commandPolicy.ensureQueuedMessages({
+          commandId,
+          threadId,
+          providerInstanceId: queuedRun.providerInstanceId,
+          capabilities: targetCapabilities,
+        });
+      }
       const latestCompletedRun = projection.runs.findLast((run) => run.status === "completed");
       const latestHandoffRun = projection.runs.findLast(isHandoffSourceRun);
       const targetLastCompletedRun = lastDeliveredRunForProviderThread(
@@ -1776,25 +1832,6 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       );
       yield* writeSystemEvents(
         [
-          ...(selectionChanged
-            ? [
-                {
-                  type:
-                    queuedRun.providerInstanceId === projection.thread.providerInstanceId
-                      ? ("thread.model-selection-updated" as const)
-                      : ("thread.provider-switched" as const),
-                  threadId,
-                  providerInstanceId: queuedRun.providerInstanceId,
-                  occurredAt: now,
-                  payload: {
-                    ...projection.thread,
-                    providerInstanceId: queuedRun.providerInstanceId,
-                    modelSelection: queuedRun.modelSelection,
-                    updatedAt: now,
-                  },
-                },
-              ]
-            : []),
           ...(handoff === null || transferId === null || latestHandoffRun === undefined
             ? []
             : [
@@ -1877,6 +1914,23 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
               reason: "Provider or model selection changed.",
             },
           })),
+          ...(followCurrentSelection
+            ? [
+                {
+                  type: "run-attempt.updated" as const,
+                  threadId,
+                  runId: queuedRun.id,
+                  nodeId: rootNodeId,
+                  providerInstanceId: queuedRun.providerInstanceId,
+                  occurredAt: now,
+                  payload: {
+                    ...attempt,
+                    providerInstanceId: queuedRun.providerInstanceId,
+                    providerThreadId: queuedProviderThread.id,
+                  },
+                },
+              ]
+            : []),
           ...checkpointEvents,
           {
             type: "provider-thread.updated",
@@ -4834,7 +4888,10 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         ]);
         projection = yield* getProjectionWithPendingEvents(command.threadId, events);
       }
-      const modelSelection = command.modelSelection ?? projection.thread.modelSelection;
+      const modelSelection =
+        command.notification !== undefined || command.delegatedCompletion !== undefined
+          ? projection.thread.modelSelection
+          : (command.modelSelection ?? projection.thread.modelSelection);
       let dispatchMode = resolveMessageDispatchIntent(
         projection,
         command.dispatchMode,
@@ -5210,6 +5267,12 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           ordinal,
           providerInstanceId: modelSelection.instanceId,
           modelSelection,
+          modelSelectionSource:
+            command.modelSelection !== undefined &&
+            command.notification === undefined &&
+            delegatedCompletion === undefined
+              ? "request"
+              : "thread",
           providerThreadId: queuedProviderThread.id,
           userMessageId: command.messageId,
           rootNodeId,

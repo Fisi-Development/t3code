@@ -650,7 +650,11 @@ const make = Effect.gen(function* () {
             assertProviderInstanceEnabled({
               projectId: projection.thread.projectId,
               commandId: command.commandId,
-              instanceId: (command.modelSelection ?? projection.thread.modelSelection).instanceId,
+              instanceId: (command.notification !== undefined ||
+              command.delegatedCompletion !== undefined
+                ? projection.thread.modelSelection
+                : (command.modelSelection ?? projection.thread.modelSelection)
+              ).instanceId,
             }),
           ),
         );
