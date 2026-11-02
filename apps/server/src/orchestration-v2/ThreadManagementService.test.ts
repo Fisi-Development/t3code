@@ -385,9 +385,9 @@ const layerDispatchChokepointTest =
       Layer.provideMerge(layerReceiptsTest),
     );
 
-it.effect(
-  "the dispatch chokepoint refuses a continuation message.dispatch on a project-disabled instance before reaching the orchestrator",
-  () => {
+it.effect.each([false, true])(
+  "the dispatch chokepoint refuses a continuation on a disabled live instance (stale notification selection: %s)",
+  (staleNotification) => {
     const projectId = ProjectId.make("project:thread-management:chokepoint");
     const threadId = ThreadId.make("thread:thread-management:chokepoint");
     const instanceId = ProviderInstanceId.make("codex_work");
@@ -410,6 +410,20 @@ it.effect(
           commandId,
           threadId,
           messageId: MessageId.make("message:thread-management:chokepoint-disabled"),
+          ...(staleNotification
+            ? {
+                modelSelection: {
+                  instanceId: ProviderInstanceId.make("codex"),
+                  model: "old-model",
+                },
+                notification: {
+                  source: { kind: "monitor" as const },
+                  outcome: "updated" as const,
+                  summary: "Background task completed",
+                  detail: "Finished",
+                },
+              }
+            : {}),
           text: "Background task completed.",
           attachments: [],
           dispatchMode: { type: "queue_after_active" },

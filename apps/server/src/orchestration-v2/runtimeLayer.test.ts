@@ -147,16 +147,35 @@ const alternateProviderInstance = {
   },
 } satisfies ProviderInstance;
 
+const openCodeInstanceId = ProviderInstanceId.make("opencode");
+const openCodeDriver = ProviderDriverKind.make("opencode");
+const openCodeProviderInstance = {
+  ...alternateProviderInstance,
+  instanceId: openCodeInstanceId,
+  driverKind: openCodeDriver,
+  continuationIdentity: { driverKind: openCodeDriver, continuationKey: "opencode:test" },
+  displayName: "OpenCode test",
+  orchestrationAdapter: {
+    ...orchestrationAdapter,
+    instanceId: openCodeInstanceId,
+    driver: openCodeDriver,
+  },
+} satisfies ProviderInstance;
+
 const layerTestProviderInstanceRegistry = Layer.succeed(
   ProviderInstanceRegistry.ProviderInstanceRegistry,
   {
     getInstance: (instanceId) =>
       Effect.succeed(
-        [providerInstance, alternateProviderInstance].find(
+        [providerInstance, alternateProviderInstance, openCodeProviderInstance].find(
           (instance) => instanceId === instance.instanceId,
         ),
       ),
-    listInstances: Effect.succeed([providerInstance, alternateProviderInstance]),
+    listInstances: Effect.succeed([
+      providerInstance,
+      alternateProviderInstance,
+      openCodeProviderInstance,
+    ]),
     listUnavailable: Effect.succeed([]),
     streamChanges: Stream.empty,
     subscribeChanges: Effect.never,
@@ -4060,6 +4079,109 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
       const afterPromotion = yield* orchestrator.getThreadProjection(threadId);
       assert.equal(afterPromotion.runs.find((run) => run.id === queuedRun.id)?.status, "cancelled");
     }),
+  );
+
+  it.effect.each(["notification", "default", "override"] as const)(
+    "keeps an explicit selection when an older queued %s starts",
+    (origin) =>
+      Effect.gen(function* () {
+        const orchestrator = yield* Orchestrator.OrchestratorV2;
+        const eventSink = yield* EventSink.EventSinkV2;
+        const threadId = ThreadId.make(`selection-after-queued-notification-${origin}`);
+        yield* orchestrator.dispatch({
+          type: "thread.create",
+          commandId: CommandId.make(`selection-queue-create-${origin}`),
+          threadId,
+          projectId: ProjectId.make(`selection-queue-project-${origin}`),
+          title: "Selection queue",
+          modelSelection,
+          runtimeMode: "full-access",
+          interactionMode: "default",
+          branch: null,
+          worktreePath: process.cwd(),
+          createdBy: "user",
+          creationSource: "web",
+        });
+        for (const automatic of [false, true]) {
+          yield* orchestrator.dispatch({
+            type: "message.dispatch",
+            commandId: CommandId.make(`selection-queue-message-${automatic}-${origin}`),
+            threadId,
+            messageId: MessageId.make(`selection-queue-message-${automatic}-${origin}`),
+            text: automatic ? "Background completion" : "Active user request",
+            attachments: [],
+            ...(!automatic || origin !== "default" ? { modelSelection } : {}),
+            createdBy: automatic && origin === "notification" ? "agent" : "user",
+            creationSource: automatic && origin === "notification" ? "server" : "web",
+            dispatchMode: { type: automatic ? "queue_after_active" : "start_immediately" },
+            ...(automatic && origin === "notification"
+              ? {
+                  notification: {
+                    source: { kind: "monitor" as const },
+                    outcome: "updated" as const,
+                    summary: "Background completion",
+                    detail: "Finished",
+                  },
+                }
+              : {}),
+          });
+        }
+        const selected = { instanceId: openCodeInstanceId, model: "selected-model" };
+        yield* orchestrator.dispatch({
+          type: "thread.model-selection.set",
+          commandId: CommandId.make(`selection-queue-explicit-switch-${origin}`),
+          threadId,
+          modelSelection: selected,
+        });
+        const before = yield* orchestrator.getThreadProjection(threadId);
+        assert.deepEqual(before.thread.modelSelection, selected);
+        const active = before.runs.find((run) => run.status === "starting")!;
+        const promoted = yield* Deferred.make<void>();
+        const afterSequence = yield* orchestrator.getThreadEventSequence(threadId);
+        yield* eventSink.stream({ threadId, afterSequence }).pipe(
+          Stream.runForEach((stored) =>
+            stored.event.type === "run.updated" && stored.event.payload.status === "starting"
+              ? Deferred.succeed(promoted, undefined)
+              : Effect.void,
+          ),
+          Effect.forkScoped,
+        );
+        yield* Effect.yieldNow;
+        const now = yield* DateTime.now;
+        yield* eventSink.write({
+          events: [
+            {
+              id: EventId.make(`selection-queue-active-completed-${origin}`),
+              type: "run.updated",
+              threadId,
+              runId: active.id,
+              providerInstanceId: active.providerInstanceId,
+              occurredAt: now,
+              payload: { ...active, status: "completed", completedAt: now },
+            },
+          ],
+        });
+        yield* Deferred.await(promoted);
+        const after = yield* orchestrator.getThreadProjection(threadId);
+        assert.deepEqual(after.thread.modelSelection, selected);
+        const started = after.runs.find((run) => run.status === "starting");
+        assert.isDefined(started);
+        const expectedSelection = origin === "override" ? modelSelection : selected;
+        const expectedDriver = origin === "override" ? driver : openCodeDriver;
+        assert.deepEqual(started.modelSelection, expectedSelection);
+        const providerThread = after.providerThreads.find(
+          (row) => row.id === started.providerThreadId,
+        );
+        assert.equal(providerThread?.driver, expectedDriver);
+        assert.equal(providerThread?.providerInstanceId, expectedSelection.instanceId);
+        const attempt = after.attempts.find((row) => row.id === started.activeAttemptId);
+        assert.equal(attempt?.providerInstanceId, expectedSelection.instanceId);
+        assert.equal(attempt?.providerThreadId, started.providerThreadId);
+        const node = after.nodes.find((row) => row.id === started.rootNodeId);
+        assert.equal(node?.providerThreadId, started.providerThreadId);
+        const scope = after.checkpointScopes.find((row) => row.id === node?.checkpointScopeId);
+        assert.equal(scope?.providerThreadId, started.providerThreadId);
+      }),
   );
 
   it.effect.each([false, true])(
