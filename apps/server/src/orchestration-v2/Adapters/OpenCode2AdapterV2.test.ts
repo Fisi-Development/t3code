@@ -1448,6 +1448,75 @@ it.layer(McpProviderSessions.layer)("OpenCode2 adapter", (it) => {
     }).pipe(Effect.scoped),
   );
 
+  it.effect("idle eviction preserves a completed turn's background descendants", () =>
+    Effect.gen(function* () {
+      const { runtime, thread } = yield* resumed([...nestedLaunch]);
+      const watch = yield* watchNested(runtime);
+      yield* runtime.startTurn(withLineage(thread));
+      yield* watch.until(() => watch.terminals.length > 0);
+      yield* runtime.unloadThread!({ providerThread: thread });
+      assert.isTrue(yield* runtime.hasPendingBackgroundWorkForThread!(thread));
+      assert.equal(watch.deep.at(-1), "running");
+    }).pipe(Effect.scoped),
+  );
+
+  it.effect.each([401, 500])(
+    "explicit detach rejects native stop failure %s without losing owned work",
+    (status) =>
+      Effect.gen(function* () {
+        const { runtime, thread } = yield* resumed([
+          ...nestedLaunch,
+          out("session.interrupt", { sessionID: SESSION }),
+          reply("session.interrupt", {
+            status,
+            body: {
+              _tag: "UnknownError",
+              message: status === 401 ? "requires_auth" : "interrupt failed",
+            },
+          }),
+        ]);
+        const watch = yield* watchNested(runtime);
+        yield* runtime.startTurn(withLineage(thread));
+        yield* watch.until(() => watch.terminals.length > 0);
+        const result = yield* runtime.unloadThread!({
+          providerThread: thread,
+          reason: "detach",
+        }).pipe(Effect.exit);
+        assert.isTrue(Exit.isFailure(result));
+        assert.isTrue(yield* runtime.hasPendingBackgroundWorkForThread!(thread));
+        assert.equal(watch.deep.at(-1), "running");
+        assert.deepEqual(watch.terminals, ["completed"]);
+        const staleStart = yield* runtime.startTurn(withLineage(thread)).pipe(Effect.exit);
+        assert.isTrue(Exit.isFailure(staleStart));
+      }).pipe(Effect.scoped),
+  );
+
+  it.effect("explicit detach retires background descendants after the parent turn completed", () =>
+    Effect.gen(function* () {
+      const { runtime, thread } = yield* resumed([
+        ...nestedLaunch,
+        out("session.interrupt", { sessionID: SESSION }),
+        reply("session.interrupt", { interrupted: true }),
+        out("session.interrupt", { sessionID: MIDDLE }),
+        reply("session.interrupt", { interrupted: true }),
+        out("session.interrupt", { sessionID: DEEP }),
+        reply("session.interrupt", { interrupted: true }),
+      ]);
+      const watch = yield* watchNested(runtime);
+      yield* runtime.startTurn(withLineage(thread));
+      yield* watch.until(() => watch.terminals.length > 0);
+      assert.deepEqual(watch.terminals, ["completed"]);
+      assert.isTrue(yield* runtime.hasPendingBackgroundWorkForThread!(thread));
+      yield* runtime.unloadThread!({ providerThread: thread, reason: "detach" });
+      assert.isFalse(yield* runtime.hasPendingBackgroundWorkForThread!(thread));
+      yield* watch.until(() => watch.deep.at(-1) === "interrupted");
+      assert.equal(watch.deep.at(-1), "interrupted");
+      assert.deepEqual(watch.terminals, ["completed"]);
+      const staleStart = yield* runtime.startTurn(withLineage(thread)).pipe(Effect.exit);
+      assert.isTrue(Exit.isFailure(staleStart));
+    }).pipe(Effect.scoped),
+  );
+
   it.effect("keeps a reused subagent's background subagent tracked and stops it", () =>
     Effect.gen(function* () {
       const again = "call-middle-again";

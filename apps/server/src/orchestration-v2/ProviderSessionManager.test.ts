@@ -334,7 +334,7 @@ const makeProviderAdapter = Effect.fnUntraced(function* (
     readonly backgroundTasksEndWithProcess?: boolean;
     readonly hangSessionScopeClose?: boolean;
     readonly startTurn?: Effect.Effect<void>;
-    readonly beforeUnload?: Effect.Effect<void>;
+    readonly beforeUnload?: Effect.Effect<void, ProviderAdapter.ProviderAdapterV2Error>;
     readonly spawnBeforeOpen?: boolean;
     readonly scopeCloseReached?: Deferred.Deferred<void>;
   } = {},
@@ -483,7 +483,7 @@ function layerTest(input: {
   readonly backgroundTasksEndWithProcess?: boolean;
   readonly hangSessionScopeClose?: boolean;
   readonly startTurn?: Effect.Effect<void>;
-  readonly beforeUnload?: Effect.Effect<void>;
+  readonly beforeUnload?: Effect.Effect<void, ProviderAdapter.ProviderAdapterV2Error>;
   readonly spawnBeforeOpen?: boolean;
   readonly scopeCloseReached?: Deferred.Deferred<void>;
   readonly serverSettingsLayer?: ReturnType<typeof ServerSettings.layerTest>;
@@ -4906,5 +4906,73 @@ it.effect(
         projectExists: false,
       });
       assert.isFalse(denied?.capabilities?.has("device"));
+    }),
+);
+
+it.effect(
+  "ProviderSessionManagerV2 rejects and retries failed explicit unload without closing the pool",
+  () =>
+    Effect.gen(function* () {
+      const state = yield* Ref.make(emptyState);
+      const fail = yield* Ref.make(true);
+      yield* Effect.gen(function* () {
+        const manager = yield* ProviderSessionManager.ProviderSessionManagerV2;
+        const eventSink = yield* EventSink.EventSinkV2;
+        const idAllocator = yield* IdAllocator.IdAllocatorV2;
+        const now = yield* DateTime.now;
+        const threadId = ThreadId.make("detach-retry");
+        const other = ThreadId.make("detach-unrelated");
+        const providerSessionId = idAllocator.derive.providerSession({
+          providerInstanceId: modelSelection.instanceId,
+        });
+        const providerThread = makeProviderThread({
+          idAllocator,
+          threadId,
+          providerSessionId,
+          now,
+        });
+        yield* eventSink.write({
+          events: [
+            yield* makeThreadCreatedEvent({ idAllocator, threadId, now }),
+            yield* makeThreadCreatedEvent({ idAllocator, threadId: other, now }),
+            {
+              id: yield* idAllocator.allocate.event({ threadId }),
+              type: "provider-thread.updated",
+              threadId,
+              driver: CODEX_DRIVER,
+              occurredAt: now,
+              payload: providerThread,
+            },
+          ],
+        });
+        const runtime = yield* manager.open({
+          threadId,
+          providerSessionId,
+          modelSelection,
+          runtimePolicy,
+        });
+        yield* manager.open({ threadId: other, providerSessionId, modelSelection, runtimePolicy });
+        yield* runtime.resumeThread({ threadId, providerThread, modelSelection, runtimePolicy });
+        const first = yield* manager.detach({ threadId, providerSessionId }).pipe(Effect.exit);
+        assert.isTrue(Exit.isFailure(first));
+        assert.equal((yield* Ref.get(state)).closeCount, 0);
+        yield* Ref.set(fail, false);
+        yield* manager.detach({ threadId, providerSessionId });
+        assert.deepEqual((yield* Ref.get(state)).unloadedNativeThreadIds, [
+          providerThread.nativeThreadRef!.nativeId ?? "",
+        ]);
+        assert.equal((yield* Ref.get(state)).closeCount, 0);
+        assert.isTrue(Option.isSome(yield* manager.get(providerSessionId)));
+      }).pipe(
+        Effect.provide(
+          layerTest({
+            state,
+            idleTimeoutMs: 1000,
+            beforeUnload: Effect.gen(function* () {
+              if (yield* Ref.get(fail)) return yield* unimplemented("requires_auth");
+            }),
+          }),
+        ),
+      );
     }),
 );
