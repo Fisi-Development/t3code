@@ -1,7 +1,7 @@
 ------------------------- MODULE PullRequestCheckRollup -------------------------
 (***************************************************************************)
 (* One check name run twice on one head by two workflow events (push and  *)
-(* pull_request), as GitHub's rollup lists them (W9, upstream #17207).    *)
+(* pull_request), as GitHub's rollup lists them (#17207).                 *)
 (* Fixed = FALSE: the reader keeps one run per name, the unfinished one    *)
 (* first, else the latest completion. Fixed = TRUE: one run per event,     *)
 (* and the row for the name takes the worse status.                        *)

@@ -99,7 +99,7 @@ const statuses = (rollup: ReadonlyArray<Record<string, unknown>>) =>
   detailOf(rollup).checks.map(({ name, status }) => [name, status]);
 
 describe("GitHub workflow event rollup", () => {
-  it("W9_failed_push_run_is_not_hidden_by_a_running_pull_request_run", () => {
+  it("a failed push run is not hidden by a running pull_request run", () => {
     const failed = run("push", "FAILURE");
     const running = run("pull_request", null);
     for (const rollup of [
@@ -111,7 +111,7 @@ describe("GitHub workflow event rollup", () => {
     }
   });
 
-  it("W9_failed_run_stays_failed_after_the_other_event_passes", () => {
+  it("a failed run stays failed after the other event's run passes", () => {
     expect(
       statuses([
         run("push", "FAILURE"),
@@ -120,7 +120,7 @@ describe("GitHub workflow event rollup", () => {
     ).toEqual([["check", "failure"]]);
   });
 
-  it("W9_both_events_pass", () => {
+  it("runs from both events passing read as passed", () => {
     const passing = [run("push", "SUCCESS"), run("pull_request", "SUCCESS")];
     expect(statuses(passing)).toEqual([["check", "success"]]);
     expect(detailOf(passing).checksState).toBe("passing");
@@ -129,14 +129,14 @@ describe("GitHub workflow event rollup", () => {
     ]);
   });
 
-  it("W9_cancelled_run_next_to_a_passing_run_is_not_a_failure", () => {
+  it("a run cancelled next to a passing run is not a failure", () => {
     expect(statuses([run("push", "CANCELLED"), run("pull_request", "SUCCESS")])).toEqual([
       ["check", "success"],
     ]);
     expect(statuses([run("push", "CANCELLED")])).toEqual([["check", "cancelled"]]);
   });
 
-  it("W9_same_job_name_in_two_workflows_stays_two_checks", () => {
+  it("the same job name in two workflows stays two checks", () => {
     const workflow = (name: string) => ({ workflowRun: { event: "push", workflow: { name } } });
     expect(
       statuses([
@@ -152,7 +152,7 @@ describe("GitHub workflow event rollup", () => {
     ]);
   });
 
-  it("W9_reruns_within_one_event_keep_the_newest_attempt", () => {
+  it("reruns within one event keep the newest attempt", () => {
     expect(
       statuses([
         run("pull_request", "FAILURE"),
@@ -161,7 +161,7 @@ describe("GitHub workflow event rollup", () => {
     ).toEqual([["check", "success"]]);
   });
 
-  it("W9_required_flag_survives_the_merge", () => {
+  it("the required flag survives merging the events", () => {
     expect(
       detailOf([
         run("push", "SUCCESS", { isRequired: true }),

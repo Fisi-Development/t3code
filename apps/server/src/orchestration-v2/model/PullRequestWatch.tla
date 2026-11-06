@@ -48,7 +48,7 @@ Init ==
 ----------------------------------------------------------------------------
 \* Host events. Each one makes the last read stale.
 
-BotEdit ==   \* a bot rewrites its summary remark (W1, W2, W3, W12)
+BotEdit ==   \* a bot rewrites its summary remark
     /\ editVer < MaxEdits
     /\ editVer' = editVer + 1
     /\ editedOn' = [editedOn EXCEPT ![head] = TRUE]
@@ -57,7 +57,7 @@ BotEdit ==   \* a bot rewrites its summary remark (W1, W2, W3, W12)
                    editWakes, ackTriggerWakes, ackOutcomeWakes, failWakes, failEpoch,
                    passWakes, conflictWakes>>
 
-AckTriggered ==   \* CodeRabbit acknowledges the agent's review command (W4, W5)
+AckTriggered ==   \* CodeRabbit acknowledges the agent's review command
     /\ ack = "none" /\ ack' = "triggered" /\ readDone' = FALSE
     /\ UNCHANGED <<head, editVer, status, run, conflict, episode, watch,
                    editedOn, editWakes, ackTriggerWakes, ackOutcomeWakes, failWakes,
@@ -75,14 +75,14 @@ Finish ==   \* the running check finishes
                    editedOn, editWakes, ackTriggerWakes, ackOutcomeWakes, failWakes,
                    failEpoch, passWakes, conflictWakes>>
 
-Rerun ==   \* a finished check is rerun: a new run, pending (W6, W7, W13)
+Rerun ==   \* a finished check is rerun: a new run, pending
     /\ status # "pending" /\ run < MaxRuns
     /\ status' = "pending" /\ run' = run + 1 /\ readDone' = FALSE
     /\ UNCHANGED <<head, editVer, ack, conflict, episode, watch,
                    editedOn, editWakes, ackTriggerWakes, ackOutcomeWakes, failWakes,
                    failEpoch, passWakes, conflictWakes>>
 
-FastRerun ==   \* a rerun that starts and finishes between two reads (W9)
+FastRerun ==   \* a rerun that starts and finishes between two reads
     /\ status # "pending" /\ run < MaxRuns
     /\ run' = run + 1 /\ status' \in {"success", "failure"} /\ readDone' = FALSE
     /\ UNCHANGED <<head, editVer, ack, conflict, episode, watch,
@@ -99,7 +99,7 @@ Push ==   \* a new head; checks start again; the push may or may not resolve a c
     /\ UNCHANGED <<editVer, ack, watch, editedOn, editWakes, ackTriggerWakes,
                    ackOutcomeWakes, failWakes, failEpoch, passWakes, conflictWakes>>
 
-BaseMove ==   \* the base branch moves: a clean branch may start conflicting (W8)
+BaseMove ==   \* the base branch moves: a clean branch may start conflicting
     /\ conflict' \in BOOLEAN
     \* A conflict that clears and returns between two reads is one conflict to the watch: a new
     \* episode starts only once a read has seen the branch clean, or on a head the watch has not
@@ -113,7 +113,7 @@ BaseMove ==   \* the base branch moves: a clean branch may start conflicting (W8
                    ackTriggerWakes, ackOutcomeWakes, failWakes, failEpoch, passWakes,
                    conflictWakes>>
 
-Rewatch ==   \* unwatch and watch again (W11): check state resumes, remarks restart now
+Rewatch ==   \* unwatch and watch again: check state resumes, remarks restart now
     /\ wSeenVer' = editVer /\ wEditTold' = 0 /\ wAck' = ack
     /\ editedOn' = [h \in Heads |-> FALSE] /\ editWakes' = [h \in Heads |-> 0]
     /\ ackTriggerWakes' = 0
@@ -169,19 +169,19 @@ Spec == Init /\ [][Next]_vars
 
 ----------------------------------------------------------------------------
 \* At most one delivery per awaited event.
-EditOncePerHead == \A h \in Heads : editWakes[h] <= 1                       \* W1 W2 W3 W12
-AckOutcomeOnce == ackOutcomeWakes <= 1                                       \* W5
-FailOncePerRun == \A h \in Heads, r \in Runs : failWakes[h][r] <= 1         \* W7
-PassOncePerEpoch == \A h \in Heads, e \in 0..MaxRuns : passWakes[h][e] <= 1 \* W6 W13
-ConflictOncePerEpisode == \A e \in 0..MaxEpisodes : conflictWakes[e] <= 1   \* W8
+EditOncePerHead == \A h \in Heads : editWakes[h] <= 1
+AckOutcomeOnce == ackOutcomeWakes <= 1
+FailOncePerRun == \A h \in Heads, r \in Runs : failWakes[h][r] <= 1
+PassOncePerEpoch == \A h \in Heads, e \in 0..MaxRuns : passWakes[h][e] <= 1
+ConflictOncePerEpisode == \A e \in 0..MaxEpisodes : conflictWakes[e] <= 1
 
 \* No wake without news.
-NoAckProgressWake == ackTriggerWakes = 0                                     \* W4 W5
+NoAckProgressWake == ackTriggerWakes = 0
 
 \* Every awaited outcome is delivered by the read that sees it.
 EditDelivered == readDone /\ editedOn[head] => editWakes[head] >= 1
 AckOutcomeDelivered == readDone /\ ack = "outcome" => ackOutcomeWakes = 1
-FailDelivered == readDone /\ status = "failure" => failWakes[head][run] >= 1  \* W9
+FailDelivered == readDone /\ status = "failure" => failWakes[head][run] >= 1
 PassDelivered == readDone /\ status = "success" => passWakes[head][failEpoch[head]] >= 1
 ConflictDelivered == readDone /\ conflict => conflictWakes[episode] >= 1
 

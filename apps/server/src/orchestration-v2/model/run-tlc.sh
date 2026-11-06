@@ -45,7 +45,7 @@ if grep -q "is violated" "$TMP/out.txt"; then
 fi
 echo "after: no violation; $(grep -E 'distinct states found, 0 states left' "$TMP/out.txt" | tail -1)"
 
-# One check run by two workflow events (W9).
+# One check run by two workflow events.
 cp PullRequestCheckRollup.tla "$TMP/"
 for fixed in FALSE TRUE; do
   for inv in FailureVisible NoPassWhilePending CancelledIsNotFailure; do

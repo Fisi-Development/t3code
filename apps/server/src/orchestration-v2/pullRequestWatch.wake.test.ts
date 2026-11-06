@@ -113,7 +113,7 @@ Review triggered.
 const remarksChange = (r: PullRequestComment) => [{ kind: "remarks" as const, remarks: [r] }];
 const failedChange = (c: PullRequestCheck) => [{ kind: "checks-failed" as const, failed: [c] }];
 
-it("W1_bot_summary_reedit_on_same_head_is_not_news", () => {
+it("a bot rewriting its own summary again on the same head is not news", () => {
   let state = watch({ headSha: "aaaaaaaaaa" });
   for (const [second, headSha, news] of [
     [1, "aaaaaaaaaa", true],
@@ -129,7 +129,7 @@ it("W1_bot_summary_reedit_on_same_head_is_not_news", () => {
   }
 });
 
-it("W2_same_note_across_four_sweeps_wakes_once", () => {
+it("a note rewritten across four reads of one head wakes once", () => {
   let state = watch({ headSha: "aaaaaaaaaa" });
   const changes = [];
   for (const second of [1, 2, 3, 4]) {
@@ -140,7 +140,7 @@ it("W2_same_note_across_four_sweeps_wakes_once", () => {
   assert.deepEqual(changes, remarksChange(walkthrough(1)));
 });
 
-it("W3_each_note_wakes_once_per_head", () => {
+it("each rewritten note wakes once per head", () => {
   let state = watch({ headSha: "aaaaaaaaaa" });
   const changes = [];
   for (const second of [1, 2, 3, 4, 5, 6, 7, 8, 9]) {
@@ -155,7 +155,7 @@ it("W3_each_note_wakes_once_per_head", () => {
   ]);
 });
 
-it("W4_coderabbit_review_triggered_ack_is_not_news", () => {
+it("CodeRabbit's review triggered reply is not news", () => {
   const triggered = ack(1);
   const first = evaluatePullRequestWatch(watch(), detail(), [triggered]);
   assert.deepEqual(first.changes, []);
@@ -198,7 +198,7 @@ Full review triggered.
   );
 });
 
-it("W5_ack_outcome_edit_is_delivered_once", () => {
+it("the acknowledgement's outcome edit wakes once", () => {
   const triggered = ack(1);
   const first = evaluatePullRequestWatch(watch(), detail(), [triggered]);
   assert.deepEqual(first.changes, []);
@@ -215,7 +215,7 @@ it("W5_ack_outcome_edit_is_delivered_once", () => {
   );
 });
 
-it("W6_checks_passed_again_after_pending_is_not_news", () => {
+it("checks passing again after a pending read is not news", () => {
   let state = watch();
   for (const [status, expected] of [
     ["success", [{ kind: "checks-passed", count: 1, required: false }]],
@@ -234,7 +234,7 @@ it("W6_checks_passed_again_after_pending_is_not_news", () => {
   }
 });
 
-it("W13_required_gate_rerun_on_same_sha_does_not_repeat_pass", () => {
+it("a required check rerun on the same head does not repeat the pass", () => {
   let state = watch();
   for (const [status, headSha, news] of [
     ["success", "aaaaaaaaaa", true],
@@ -255,7 +255,7 @@ it("W13_required_gate_rerun_on_same_sha_does_not_repeat_pass", () => {
   }
 });
 
-it("W7_job_retry_that_fails_again_is_news", () => {
+it("a retried job that fails again is news", () => {
   const failed = check("lint", "failure");
   const first = evaluatePullRequestWatch(watch(), detail({ checks: [failed] }), noRemarks);
   assert.deepEqual(first.changes, failedChange(failed));
@@ -271,7 +271,7 @@ it("W7_job_retry_that_fails_again_is_news", () => {
   );
 });
 
-it("W8_new_conflict_after_resolving_push_is_news", () => {
+it("a new conflict after a resolving push is news", () => {
   const first = evaluatePullRequestWatch(
     watch(),
     detail({ mergeability: "conflicting" }),
@@ -290,7 +290,7 @@ it("W8_new_conflict_after_resolving_push_is_news", () => {
   );
 });
 
-it("W9_rerun_failing_again_between_polls_is_news", () => {
+it("a rerun that fails again between two reads is news", () => {
   const u1 = { ...check("lint", "failure"), url: "https://ci.example/jobs/1" };
   const u2 = { ...u1, url: "https://ci.example/jobs/2" };
   const first = evaluatePullRequestWatch(watch(), detail({ checks: [u1] }), noRemarks);
@@ -311,12 +311,12 @@ it("W9_rerun_failing_again_between_polls_is_news", () => {
   );
 });
 
-it("W11_rewatch_does_not_redeliver_an_edit_seen_before_it", () => {
+it("watching again does not repeat an edit from before the watch", () => {
   const old = { ...walkthrough(1), editedAt: "2026-10-02T11:59:59.000Z" };
   assert.deepEqual(evaluatePullRequestWatch(watch(), detail(), [old]).changes, []);
 });
 
-it("W12_ci_status_comment_rewritten_on_a_new_head_wakes_once", () => {
+it("a CI status comment rewritten on a new head wakes once", () => {
   const old = evaluatePullRequestWatch(watch(), detail(), noRemarks);
   const r = {
     ...walkthrough(1),
@@ -333,7 +333,7 @@ it("W12_ci_status_comment_rewritten_on_a_new_head_wakes_once", () => {
   );
 });
 
-it("restart_keeps_the_wake_state", () => {
+it("a restart keeps what the watch already told", () => {
   const roundTrip = (state: ThreadPullRequestWatch) => {
     const encoded: unknown = JSON.parse(JSON.stringify(encodeWatch(state)));
     return decodeWatch(encoded);
