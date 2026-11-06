@@ -1,3 +1,4 @@
+import * as DelegatedWorkAwaits from "@t3tools/provider-core/server/DelegatedWorkAwaits";
 import { historyResponseItems } from "@t3tools/provider-core/server/handoffBudget";
 import { makeProviderFailure } from "@t3tools/provider-core/server/failure";
 import {
@@ -8474,7 +8475,162 @@ describe("CodexAdapterV2 post-settle continuation", () => {
         event.type === "provider_thread.updated" ? [event.providerThread.goal?.status ?? null] : [],
       );
 
-    it.effect("keeps a /goal run open across the turns Codex continues on its own", () =>
+    const delegatedGoalWait = (resume: boolean) =>
+      Effect.gen(function* () {
+        const milestone = yield* Deferred.make<void>();
+        const interrupted = yield* Deferred.make<void>();
+        const requests: Array<{ method: string; params: unknown }> = [];
+        const prompt = "Wait for the delegate";
+        const transcript = makeCodexReplayTranscript({
+          scenario: resume ? "goal-delegated-resume" : "goal-delegated-pause",
+          entries: [
+            ...codexReplayPreamble({ nativeThreadId, nativeTurnId: "goal-turn", prompt }),
+            notification("goal active", "thread/goal/updated", {
+              threadId: nativeThreadId,
+              turnId: "goal-turn",
+              goal: codexGoal("active", 10),
+            }),
+            notification("turn done", "turn/completed", {
+              threadId: nativeThreadId,
+              turn: makeCodexReplayTurn({ id: "goal-turn", status: "completed" }),
+            }),
+            notification("late continuation", "turn/started", {
+              threadId: nativeThreadId,
+              turn: makeCodexReplayTurn({ id: "goal-turn-2", status: "inProgress" }),
+            }),
+            {
+              type: "expect_outbound",
+              label: "pause for delegated work",
+              frame: {
+                id: 4,
+                method: "thread/goal/set",
+                params: { threadId: nativeThreadId, status: "paused" },
+              },
+            },
+            ...request(
+              5,
+              "thread/goal/set",
+              { threadId: nativeThreadId, status: "paused" },
+              {
+                goal: codexGoal("paused", 10),
+              },
+            ),
+            ...request(
+              6,
+              "turn/interrupt",
+              { threadId: nativeThreadId, turnId: "goal-turn-2" },
+              {},
+            ),
+            {
+              type: "emit_inbound",
+              label: "pause response",
+              frame: { id: 4, result: { goal: codexGoal("paused", 10) } },
+            },
+            ...(resume
+              ? [
+                  ...withReplayRequestId(
+                    codexReplayPreamble({
+                      nativeThreadId,
+                      nativeTurnId: "wake-turn",
+                      prompt: "Delegate finished",
+                    }).slice(5),
+                    7,
+                  ),
+                  ...request(
+                    8,
+                    "thread/goal/set",
+                    { threadId: nativeThreadId, status: "active" },
+                    {
+                      goal: codexGoal("active", 10),
+                    },
+                  ),
+                ]
+              : []),
+          ],
+        });
+        const harness = yield* makeCodexReplayHarness(
+          transcript,
+          (event) =>
+            event.type === "provider_turn.updated" &&
+            event.providerTurn.status === "running" &&
+            event.providerTurn.ordinal === 2
+              ? Deferred.succeed(milestone, undefined)
+              : Effect.void,
+          (method, params) =>
+            Effect.gen(function* () {
+              requests.push({ method, params });
+              if (method === "thread/goal/set") yield* Deferred.succeed(milestone, undefined);
+              if (method === "turn/interrupt") yield* Deferred.succeed(interrupted, undefined);
+            }),
+        );
+        yield* harness.runtime.startTurn(yield* goalTurnInput(harness, prompt));
+        yield* Deferred.await(milestone);
+        assert.include(
+          requests.map((request) => request.method),
+          "thread/goal/set",
+          "pause the goal instead of adopting the continuation",
+        );
+        yield* harness.firstTerminal;
+        yield* Deferred.await(interrupted);
+        const allocator = yield* IdAllocator.IdAllocatorV2;
+        assert.deepEqual(
+          harness.terminalEvents().map((event) => [event.providerTurnId, event.status]),
+          [
+            [
+              allocator.derive.providerTurn({
+                driver: CodexAdapterV2.CODEX_DRIVER_KIND,
+                nativeTurnId: "goal-turn",
+              }),
+              "completed",
+            ],
+          ],
+        );
+        assert.deepEqual(
+          harness.events.flatMap((event) =>
+            event.type === "provider_turn.updated" && event.providerTurn.status === "running"
+              ? [event.providerTurn.ordinal]
+              : [],
+          ),
+          [1],
+        );
+        assert.equal(providerGoals(harness.events).at(-1), "paused");
+        if (resume) {
+          const beforeWake = requests.length;
+          yield* harness.runtime.startTurn(yield* goalTurnInput(harness, "Delegate finished"));
+          assert.deepEqual(
+            requests
+              .slice(beforeWake)
+              .filter(({ method }) => method === "turn/start" || method === "thread/goal/set"),
+            [
+              { method: "turn/start", params: requests[beforeWake]?.params },
+              { method: "thread/goal/set", params: { threadId: nativeThreadId, status: "active" } },
+            ],
+          );
+          assert.equal(providerGoals(harness.events).at(-1), "active");
+        }
+      }).pipe(
+        Effect.scoped,
+        Effect.provide(
+          Layer.mergeAll(
+            IdAllocator.layer,
+            McpProviderSessions.layer,
+            NodeServices.layer,
+            NodeCrypto.layer,
+            Layer.succeed(DelegatedWorkAwaits.DelegatedWorkAwaits, {
+              awaitsDelegatedWork: () => Effect.succeed(true),
+            }),
+          ),
+        ),
+      );
+
+    it.effect("D7_goal_turn_does_not_continue_while_a_delegated_task_will_wake_the_parent", () =>
+      delegatedGoalWait(false),
+    );
+    it.effect("D7_next_turn_resumes_a_goal_paused_for_delegated_work", () =>
+      delegatedGoalWait(true),
+    );
+
+    it.effect("D7_goal_still_continues_when_no_delegated_work_is_pending", () =>
       Effect.gen(function* () {
         const transcript = makeCodexReplayTranscript({
           scenario: "goal-continuation",

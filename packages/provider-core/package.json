@@ -111,6 +111,10 @@
       "types": "./src/server/providerAuthFlow.ts",
       "import": "./src/server/providerAuthFlow.ts"
     },
+    "./server/DelegatedWorkAwaits": {
+      "types": "./src/server/DelegatedWorkAwaits.ts",
+      "import": "./src/server/DelegatedWorkAwaits.ts"
+    },
     "./server/ProviderContinuationRequests": {
       "types": "./src/server/ProviderContinuationRequests.ts",
       "import": "./src/server/ProviderContinuationRequests.ts"
