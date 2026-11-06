@@ -10,7 +10,7 @@ export const layer = Layer.effect(
     const projectionStore = yield* ProjectionStore.ProjectionStoreV2;
     return {
       awaitsDelegatedWork: Effect.fn("DelegatedWorkAwaits.awaitsDelegatedWork")(
-        function* (threadId: ThreadId) {
+        function* (threadId: ThreadId, options: { readonly includeClaimedDeliveries: boolean }) {
           // Settled, delivered tasks are left out in SQL, so a thread with thousands of them stays cheap.
           const { subagents } = yield* projectionStore.getThreadRecords(threadId, ["subagents"], {
             omitSettledSubagents: true,
@@ -21,7 +21,7 @@ export const layer = Layer.effect(
               task.completionWake !== "settled_only" &&
               (isOrchestrationV2WorkActive(task.status) ||
                 task.completionDelivery?.state === "pending" ||
-                task.completionDelivery?.state === "claimed"),
+                (options.includeClaimedDeliveries && task.completionDelivery?.state === "claimed")),
           );
         },
         Effect.catch((cause) =>

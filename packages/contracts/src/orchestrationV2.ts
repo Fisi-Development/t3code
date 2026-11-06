@@ -1075,6 +1075,8 @@ export type OrchestrationV2ProviderGoalStatus = typeof OrchestrationV2ProviderGo
 export const OrchestrationV2ProviderGoal = Schema.Struct({
   objective: TrimmedNonEmptyString,
   status: OrchestrationV2ProviderGoalStatus,
+  /** T3 paused this goal while the thread waits on delegated tasks, and resumes it. */
+  heldForDelegatedWork: Schema.optional(Schema.Literal(true)),
   tokensUsed: Schema.optional(NonNegativeInt),
   tokenBudget: Schema.optional(Schema.NullOr(NonNegativeInt)),
   timeUsedSeconds: Schema.optional(NonNegativeInt),

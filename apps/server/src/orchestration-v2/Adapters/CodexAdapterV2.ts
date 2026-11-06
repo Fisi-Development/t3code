@@ -1992,7 +1992,6 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
         // Serialize native completion and interrupt timeout so only one publishes terminal events.
         const turnTerminalizationPermit = yield* Semaphore.make(1);
         const goalsByNativeThread = new Map<string, OrchestrationV2ProviderGoal | null>();
-        const goalsPausedForDelegatedWork = new Set<string>();
         const rootProviderThreads = new Map<string, OrchestrationV2ProviderThread>();
         const goalHolds = new Map<string, CodexGoalHold>();
         const continuedRuns = new Map<ProviderTurnId, Array<ActiveCodexTurnContext>>();
@@ -2059,12 +2058,54 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
           });
         });
 
+        const clearDelegatedGoalHold = Effect.fnUntraced(function* (nativeThreadId: string) {
+          const current = goalsByNativeThread.get(nativeThreadId);
+          if (current == null) return;
+          const { heldForDelegatedWork, ...goal } = current;
+          if (!heldForDelegatedWork) return;
+          goalsByNativeThread.set(nativeThreadId, goal);
+          yield* emitGoalUpdate(nativeThreadId);
+        });
+
+        const rememberCodexGoal = (
+          nativeThreadId: string,
+          goal: OrchestrationV2ProviderGoal | null,
+        ) => {
+          goalsByNativeThread.set(
+            nativeThreadId,
+            goal === null
+              ? null
+              : {
+                  ...goal,
+                  ...(goal.status === "paused" &&
+                  goalsByNativeThread.get(nativeThreadId)?.heldForDelegatedWork
+                    ? { heldForDelegatedWork: true as const }
+                    : {}),
+                },
+          );
+        };
+
         const rememberRootProviderThread = Effect.fnUntraced(function* (
           providerThread: OrchestrationV2ProviderThread,
+          refreshHold = false,
         ) {
           const nativeThreadId = providerThread.nativeThreadRef?.nativeId;
           if (nativeThreadId == null) return;
+          // An idle Stop clears the projected goal without opening the provider session.
+          const projectedGoal = providerThread.goal;
+          if (
+            refreshHold &&
+            goalsByNativeThread.get(nativeThreadId)?.heldForDelegatedWork &&
+            projectedGoal !== undefined &&
+            (projectedGoal === null ||
+              (projectedGoal.status === "paused" && !projectedGoal.heldForDelegatedWork))
+          ) {
+            goalsByNativeThread.set(nativeThreadId, projectedGoal);
+          }
           rootProviderThreads.set(nativeThreadId, providerThread);
+          if (!goalsByNativeThread.has(nativeThreadId) && providerThread.goal !== undefined) {
+            goalsByNativeThread.set(nativeThreadId, providerThread.goal);
+          }
           yield* emitGoalUpdate(nativeThreadId);
         });
 
@@ -4687,7 +4728,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
 
         yield* client.handleServerNotification("thread/goal/updated", (payload) =>
           Effect.gen(function* () {
-            goalsByNativeThread.set(payload.threadId, providerGoalFromCodex(payload.goal));
+            rememberCodexGoal(payload.threadId, providerGoalFromCodex(payload.goal));
             yield* emitGoalUpdate(payload.threadId);
             if (payload.goal.status !== "active") yield* releaseGoalHold(payload.threadId);
           }).pipe(turnTerminalizationPermit.withPermits(1)),
@@ -6009,7 +6050,14 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
           if (forDelegatedWork) {
             const activation = goalActivations.get(nativeThreadId);
             if (activation !== undefined) activation.stopped = true;
-            goalsPausedForDelegatedWork.add(nativeThreadId);
+            const goal = goalsByNativeThread.get(nativeThreadId);
+            if (goal != null) {
+              goalsByNativeThread.set(nativeThreadId, {
+                ...goal,
+                status: "paused",
+                heldForDelegatedWork: true,
+              });
+            }
             yield* Effect.logInfo("orchestration-v2.codex-goal-paused-for-delegated-work", {
               nativeThreadId,
             });
@@ -6024,7 +6072,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
               // The hold is already claimed, so an unanswered pause must not keep the run open.
               Effect.timeout("10 seconds"),
               Effect.flatMap(({ goal }) => {
-                goalsByNativeThread.set(nativeThreadId, providerGoalFromCodex(goal));
+                rememberCodexGoal(nativeThreadId, providerGoalFromCodex(goal));
                 return emitGoalUpdate(nativeThreadId);
               }),
               Effect.catch((cause) =>
@@ -6222,7 +6270,9 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                   (activation !== undefined && !activation.stopped));
               const pausesForDelegatedWork =
                 holdsForGoal &&
-                (yield* delegatedWorkAwaits.awaitsDelegatedWork(input.context.projectionThreadId));
+                (yield* delegatedWorkAwaits.awaitsDelegatedWork(input.context.projectionThreadId, {
+                  includeClaimedDeliveries: true,
+                }));
               const completedTurn: OrchestrationV2ProviderTurn = {
                 id: input.context.providerTurnId,
                 providerThreadId: input.context.providerThread.id,
@@ -6723,7 +6773,8 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
           if (goalThreadId == null) {
             return { turnInput, goalTurns: [] as ReadonlyArray<ActiveCodexTurnContext> };
           }
-          goalsPausedForDelegatedWork.delete(goalThreadId);
+          yield* rememberRootProviderThread(turnInput.providerThread);
+          yield* clearDelegatedGoalHold(goalThreadId);
           goalStops.set(goalThreadId, (goalStops.get(goalThreadId) ?? 0) + 1);
           return yield* Effect.gen(function* () {
             // The run can settle while the pause is in flight, which drops its record.
@@ -6926,8 +6977,8 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
           ) {
             if (command.type === "set") yield* validateCodexGoalObjective(command.objective);
             const threadId = yield* getNativeThreadId(turnInput.providerThread);
-            if (command.type !== "show") goalsPausedForDelegatedWork.delete(threadId);
-            rootProviderThreads.set(threadId, turnInput.providerThread);
+            yield* rememberRootProviderThread(turnInput.providerThread);
+            yield* clearDelegatedGoalHold(threadId);
             const readGoal = client
               .request("thread/goal/get", { threadId })
               .pipe(
@@ -7164,6 +7215,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
             function* (threadInput) {
               const nativeThreadId = yield* getNativeThreadId(threadInput.providerThread);
               const appThreadId = threadInput.threadId ?? threadInput.providerThread.appThreadId;
+              yield* rememberRootProviderThread(threadInput.providerThread, true);
               const resume = resumeNativeThread(nativeThreadId, {
                 excludeTurns: true,
                 ...codexThreadRuntimeParams({
@@ -7283,7 +7335,18 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                 turnInput.restartContinuationOfRunId === undefined
                   ? yield* toCodexInput(turnInput)
                   : [];
-              if (threadId != null && goalsPausedForDelegatedWork.delete(threadId)) {
+              if (threadId != null) {
+                yield* rememberRootProviderThread(turnInput.providerThread, true);
+              }
+              const goal = threadId == null ? undefined : goalsByNativeThread.get(threadId);
+              // A held goal resumes with the first root turn after its delegated work ends; until then it projects as paused.
+              if (
+                threadId != null &&
+                goal?.heldForDelegatedWork &&
+                !(yield* delegatedWorkAwaits.awaitsDelegatedWork(turnInput.threadId, {
+                  includeClaimedDeliveries: false,
+                }))
+              ) {
                 yield* startGoalTurn(turnInput, threadId, Effect.succeed(input));
                 yield* emitGoalUpdate(threadId);
               } else {

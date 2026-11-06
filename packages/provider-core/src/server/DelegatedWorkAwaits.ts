@@ -4,7 +4,10 @@ import * as Effect from "effect/Effect";
 
 /** True while the thread has delegated tasks whose completion will wake it. */
 export class DelegatedWorkAwaits extends Context.Reference<{
-  readonly awaitsDelegatedWork: (threadId: ThreadId) => Effect.Effect<boolean>;
+  readonly awaitsDelegatedWork: (
+    threadId: ThreadId,
+    options: { readonly includeClaimedDeliveries: boolean },
+  ) => Effect.Effect<boolean>;
 }>("@t3tools/provider-core/server/DelegatedWorkAwaits", {
   defaultValue: () => ({ awaitsDelegatedWork: () => Effect.succeed(false) }),
 }) {}

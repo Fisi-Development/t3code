@@ -11220,12 +11220,27 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       { readonly type: "run.interrupt" | "thread.stop" }
     >;
     readonly events: Ref.Ref<Array<OrchestrationV2DomainEvent>>;
-    readonly projection: Pick<OrchestrationV2ThreadProjection, "thread" | "runs" | "subagents">;
+    readonly projection: Pick<
+      OrchestrationV2ThreadProjection,
+      "thread" | "runs" | "subagents" | "providerThreads"
+    >;
     readonly cohortRunIds: ReadonlyArray<RunId>;
     readonly now: DateTime.Utc;
   }) {
     const emitEvent = emit(input.events, input.command);
     const { runs, subagents } = input.projection;
+    for (const providerThread of input.projection.providerThreads) {
+      if (providerThread.goal == null) continue;
+      const { heldForDelegatedWork, ...goal } = providerThread.goal;
+      if (!heldForDelegatedWork) continue;
+      yield* emitEvent({
+        type: "provider-thread.updated",
+        threadId: input.projection.thread.id,
+        providerInstanceId: providerThread.providerInstanceId,
+        occurredAt: input.now,
+        payload: { ...providerThread, goal, updatedAt: input.now },
+      });
+    }
     let { thread } = input.projection;
     let recovery = thread.limitRecovery;
     const latest = latestExecutedRun(runs);
@@ -12998,6 +13013,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         )
         .toSorted((a, b) => compareTaskStart(b, a))[0];
       const repeatsNotificationResult =
+        !parentProjection.providerThreads.some((thread) => thread.goal?.heldForDelegatedWork) &&
         task.id !== forkedFrom.nodeId &&
         childControls.messages.some(
           (message) => message.id === childRun.userMessageId && message.notification !== undefined,
