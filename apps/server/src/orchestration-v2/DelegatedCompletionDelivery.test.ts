@@ -2224,14 +2224,13 @@ it.layer(Layer.merge(layerTest, ProviderContinuationRequests.layer))(
           (message) => message.id === completion.messageId,
         )!;
         assert.include(delivery.text, reply.trim());
-        if (name.startsWith("D4_")) {
-          assert.isTrue(
-            delivery.text.startsWith(
-              `Delegated task ${followup.id}${followup.title == null ? "" : ` (${followup.title})`} [completed], a follow-up of task ${child.taskId} after the child ran again:`,
-            ),
-            delivery.text,
-          );
-        }
+        // Every follow-up wake names the task it follows.
+        assert.isTrue(
+          delivery.text.startsWith(
+            `Delegated task ${followup.id}${followup.title == null ? "" : ` (${followup.title})`} [completed], a follow-up of task ${child.taskId} after the child ran again:`,
+          ),
+          delivery.text,
+        );
       }),
     );
 
