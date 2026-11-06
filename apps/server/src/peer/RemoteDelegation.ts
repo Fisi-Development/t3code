@@ -14,6 +14,7 @@ import {
   type RunId,
   type ThreadId,
 } from "@t3tools/contracts";
+import * as Cause from "effect/Cause";
 import * as Context from "effect/Context";
 import * as SecureRandom from "effect/crypto/SecureRandom";
 import * as Duration from "effect/Duration";
@@ -21,6 +22,7 @@ import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Schedule from "effect/Schedule";
+import * as Schema from "effect/Schema";
 import * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
 import type * as Tool from "effect/ai/Tool";
@@ -45,6 +47,8 @@ import * as PeerLinks from "./PeerLinks.ts";
 const FOLLOW_WAIT_MS = 10 * 60 * 1_000;
 /** A linked environment that stops answering is retried, backing off to this. */
 const FOLLOW_MAX_BACKOFF = Duration.minutes(5);
+// Repeated defects must leave an outcome instead of retrying a broken follower forever.
+const FOLLOW_MAX_DEFECTS = 3;
 /** How a follower retries; tests step it by hand. */
 export const FollowRetrySchedule = Context.Reference<Schedule.Schedule<unknown>>(
   "t3/peer/RemoteDelegation/FollowRetrySchedule",
@@ -97,6 +101,8 @@ export class RemoteDelegation extends Context.Service<
     readonly start: () => Effect.Effect<void, never, Scope.Scope>;
   }
 >()("t3/peer/RemoteDelegation") {}
+
+const isOrchestratorMcpFailure = Schema.is(OrchestratorMcpFailure);
 
 /** The other side refused because the thread there runs above this caller's modes. */
 const isModeRefusal = (error: OrchestratorMcpFailure) =>
@@ -512,22 +518,53 @@ const make = Effect.gen(function* () {
    * dropped route) is retried with back-off, and so is completing.
    */
   const follow = (parentThreadId: ThreadId, taskId: NodeId): Effect.Effect<void> =>
-    followOnce(parentThreadId, taskId).pipe(
-      // `false` means it is still running there: follow again straight away.
-      Effect.repeat({ while: (done) => !done }),
-      Effect.catchTags({
-        OrchestratorMcpFailure: Effect.fn("RemoteDelegation.followFailed")(function* (error) {
-          const reason = yield* finalReason(parentThreadId, taskId, error);
-          if (reason === undefined) return yield* error;
-          // Gone there, or no link to reach it by: nothing left to stop there.
-          const { task } = yield* readTask(parentThreadId, taskId);
-          const stopCount = task?.remoteChild?.stopCount;
-          yield* complete(parentThreadId, taskId, "failed", reason, "stopped", stopCount);
+    Effect.suspend(() => {
+      let defects = 0;
+      return followOnce(parentThreadId, taskId).pipe(
+        Effect.tap(() =>
+          Effect.sync(() => {
+            defects = 0;
+          }),
+        ),
+        // `false` means it is still running there: follow again straight away.
+        Effect.repeat({ while: (done) => !done }),
+        Effect.catchTags({
+          OrchestratorMcpFailure: Effect.fn("RemoteDelegation.followFailed")(function* (error) {
+            const reason = yield* finalReason(parentThreadId, taskId, error);
+            if (reason === undefined) return yield* error;
+            // Gone there, or no link to reach it by: nothing left to stop there.
+            const { task } = yield* readTask(parentThreadId, taskId);
+            const stopCount = task?.remoteChild?.stopCount;
+            yield* complete(parentThreadId, taskId, "failed", reason, "stopped", stopCount);
+          }),
         }),
-      }),
-      Effect.retry(followRetry),
-      Effect.ignoreCause({ log: true }),
-    );
+        Effect.catchCause((cause) => {
+          if (Cause.hasInterrupts(cause)) return Effect.interrupt;
+          defects = Cause.hasDies(cause) ? defects + 1 : 0;
+          return Effect.fail(cause);
+        }),
+        Effect.retry({ schedule: followRetry, while: () => defects < FOLLOW_MAX_DEFECTS }),
+        Effect.catch(
+          Effect.fn("RemoteDelegation.followAbandoned")(function* (cause) {
+            const { task } = yield* readTask(parentThreadId, taskId);
+            if (task?.result !== null || task.remoteChild === undefined) return;
+            const { label, environmentId, threadId, stopCount } = task.remoteChild;
+            const error = Cause.findErrorOption(cause);
+            const message =
+              Option.isSome(error) && isOrchestratorMcpFailure(error.value)
+                ? error.value.message
+                : Cause.pretty(cause).split("\n")[0];
+            const reason = `This environment stopped following the task in ${label}: ${message}. Its thread there may still be running; read it with t3_thread_read (environmentId ${environmentId}, threadId ${threadId}).`;
+            yield* complete(parentThreadId, taskId, "failed", reason, undefined, stopCount);
+          }),
+        ),
+        Effect.catchCause((cause) =>
+          Cause.hasInterrupts(cause)
+            ? Effect.interrupt
+            : Effect.logWarning("remote-delegation.follow-abandoned", { taskId, cause }),
+        ),
+      );
+    });
 
   /**
    * One wait on the task's thread there; true once the task here is done.
