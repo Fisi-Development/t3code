@@ -813,6 +813,7 @@ export const layerWithOptions = (
       const writeReleasedBackgroundWorkEvents = Effect.fn(
         "ProviderSessionManager.writeReleasedBackgroundWorkEvents",
       )(function* (input: {
+        readonly entry: Pick<LiveSessionEntry, "busyTurns">;
         readonly releasedBackgroundTasks: ReadonlyArray<ReleasedBackgroundTasks>;
         readonly reason: ProviderSessionReleaseReason;
         readonly detail?: string;
@@ -825,8 +826,14 @@ export const layerWithOptions = (
           tasks,
         } of input.releasedBackgroundTasks) {
           const taskIds = tasks.map((task) => task.taskId);
+          // A turn that dies with its session already fails with the reason; a second wake would
+          // start another run and hand a delegating parent a second result.
+          const turnWasRunning = [...input.entry.busyTurns].some((turnKey) =>
+            turnKey.startsWith(busyTurnPrefix(providerThreadId)),
+          );
           if (
             (input.reason === "idle_timeout" || input.reason === "runtime_error") &&
+            !turnWasRunning &&
             backgroundWorkHoldsCompletion(tasks)
           ) {
             const key = `background-work-released:${providerSessionId}:${providerThreadId}:${DateTime.toEpochMillis(input.releasedAt)}`;

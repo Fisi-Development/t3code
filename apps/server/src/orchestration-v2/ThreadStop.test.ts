@@ -1829,7 +1829,7 @@ const waitingBackgroundFixture = Effect.fn("test.waitingBackgroundFixture")(func
   return { threadId, providerThreadId, providerSessionId };
 });
 
-it.effect.each(["awaited", "dev-server control", "PR-watch control"])(
+it.effect.each(["awaited", "dev-server control", "empty-roster control"])(
   "R1 settle refuses a thread waiting on an awaited background command (%s)",
   (row) =>
     Effect.gen(function* () {
@@ -1839,12 +1839,12 @@ it.effect.each(["awaited", "dev-server control", "PR-watch control"])(
         row,
         row === "awaited",
       );
-      if (row === "PR-watch control") {
+      if (row === "empty-roster control") {
         const providerThread = (yield* projections.getThreadRecords(threadId, [
           "providerThreads",
         ])).providerThreads.find((thread) => thread.id === providerThreadId)!;
         yield* projections.apply({
-          id: EventId.make("event:only-watch"),
+          id: EventId.make("event:empty-roster"),
           type: "provider-thread.updated",
           threadId,
           occurredAt: yield* DateTime.now,

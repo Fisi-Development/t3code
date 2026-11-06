@@ -4416,15 +4416,23 @@ it.effect("ProviderSessionManagerV2 gives a delegated child its project's device
 );
 
 it.effect.each([
-  ["R5 idle release of a session past its pin delivers one notice", "idle", true],
+  ["R5 idle release of a session past its pin delivers one notice", "idle", true, true],
   [
     "R5 provider process exit delivers one notice to a thread waiting on background work",
     "crash",
     true,
+    true,
   ],
-  ["R5 a retried release record delivers one notice", "retry", true],
-  ["R5 unawaited background work is released quietly (control)", "idle", false],
-] as const)("%s", ([_name, mode, awaited]) =>
+  ["R5 a retried release record delivers one notice", "retry", true, true],
+  ["R5 unawaited background work is released quietly (control)", "idle", false, false],
+  // The failed turn is the outcome; a notice would start a second run after it.
+  [
+    "R5 a process exit during a running turn leaves the failed turn as the only outcome",
+    "busy-crash",
+    true,
+    false,
+  ],
+] as const)("%s", ([_name, mode, awaited, notice]) =>
   Effect.gen(function* () {
     const state = yield* Ref.make(emptyState);
     const releaseRosterWritten = yield* Deferred.make<void>();
@@ -4467,8 +4475,35 @@ it.effect.each([
         ],
       });
       const afterSequence = yield* eventSink.latestSequence({ threadId });
-      yield* manager.open({ threadId, providerSessionId, modelSelection, runtimePolicy });
-      if (mode === "idle") {
+      const runtime = yield* manager.open({
+        threadId,
+        providerSessionId,
+        modelSelection,
+        runtimePolicy,
+      });
+      if (mode === "busy-crash") {
+        const runId = idAllocator.derive.run({ threadId, ordinal: 1 });
+        yield* runtime.startTurn({
+          appThread: (yield* projections.getThreadProjection(threadId)).thread,
+          threadId,
+          runId,
+          runOrdinal: 1,
+          providerTurnOrdinal: 1,
+          attemptId: idAllocator.derive.runAttempt({ runId, attemptOrdinal: 1 }),
+          rootNodeId: idAllocator.derive.rootNode({ runId }),
+          providerThread,
+          message: {
+            createdBy: "user",
+            creationSource: "web",
+            messageId: yield* idAllocator.allocate.message({ threadId, ordinal: 1 }),
+            text: "turn",
+            attachments: [],
+          },
+          modelSelection,
+          runtimePolicy,
+        });
+        yield* manager.release({ providerSessionId, reason: "runtime_error" });
+      } else if (mode === "idle") {
         yield* TestClock.adjust("3 seconds");
       } else if (mode === "crash") {
         yield* eventSink
@@ -4496,15 +4531,15 @@ it.effect.each([
       const effects = yield* sql<{ effect_id: string; payload_json: string }>`
         SELECT effect_id, payload_json FROM orchestration_v2_effect_outbox
         WHERE thread_id = ${threadId} AND effect_type = 'background-work.released'`;
-      assert.lengthOf(effects, awaited ? 1 : 0, "awaited release must persist one notice effect");
+      assert.lengthOf(effects, notice ? 1 : 0, "notice effects persisted by the release");
       const roster =
         (yield* projections.getThreadRecords(threadId, ["providerThreads"])).providerThreads[0]!
           .pendingBackgroundTasks ?? [];
       assert.deepEqual(
         roster.map((task) => task.taskId),
-        awaited ? ["b78m03be3"] : [],
+        notice ? ["b78m03be3"] : [],
       );
-      if (awaited) {
+      if (notice) {
         const request = JSON.parse(effects[0]!.payload_json);
         assert.deepEqual(request.taskIds, ["b78m03be3"]);
         assert.equal(request.reason, mode === "crash" ? "runtime_error" : "idle_timeout");
@@ -4514,9 +4549,9 @@ it.effect.each([
       const notices = delivered.messages.filter(
         (message) => message.notification?.summary === "Background work stopped without a result",
       );
-      assert.lengthOf(notices, awaited ? 1 : 0);
+      assert.lengthOf(notices, notice ? 1 : 0);
       assert.isEmpty(delivered.providerThreads[0]!.pendingBackgroundTasks ?? []);
-      if (awaited) {
+      if (notice) {
         assert.equal(
           String(notices[0]!.id),
           `message:${effects[0]!.effect_id.slice("effect:".length)}`,
