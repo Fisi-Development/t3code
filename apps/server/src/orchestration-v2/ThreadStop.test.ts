@@ -1900,3 +1900,62 @@ it.effect("R1 settle succeeds after Stop clears the wait (control)", () =>
     );
   }).pipe(Effect.provide(layerTest)),
 );
+
+it.effect.each(["cleared", "replacement"] as const)(
+  "R5 a roster another writer already cleared gets no notice (%s control)",
+  (row) =>
+    Effect.gen(function* () {
+      const orchestrator = yield* Orchestrator.OrchestratorV2;
+      const projections = yield* ProjectionStore.ProjectionStoreV2;
+      const outbox = yield* EffectOutbox.EffectOutboxV2;
+      const worker = yield* EffectWorker.OrchestrationEffectWorkerV2;
+      const { threadId, providerThreadId, providerSessionId } = yield* waitingBackgroundFixture(
+        row,
+        true,
+      );
+      const providerThread = (yield* projections.getThreadRecords(threadId, [
+        "providerThreads",
+      ])).providerThreads.find((thread) => thread.id === providerThreadId)!;
+      yield* projections.apply({
+        id: EventId.make(`event:changed:${row}`),
+        type: "provider-thread.updated",
+        threadId,
+        occurredAt: yield* DateTime.now,
+        payload: {
+          ...providerThread,
+          ...(row === "cleared"
+            ? { pendingBackgroundTasks: [] }
+            : { providerSessionId: ProviderSessionId.make("replacement") }),
+        },
+      });
+      yield* outbox.enqueue([
+        {
+          id: `effect:background-work-released:${providerSessionId}:${providerThreadId}:0`,
+          commandId: CommandId.make("command:release"),
+          threadId,
+          request: {
+            type: "background-work.released",
+            providerThreadId,
+            providerSessionId,
+            reason: "idle_timeout",
+            taskIds: ["b78m03be3"],
+          },
+        },
+      ]);
+      yield* worker.drain();
+      const projection = yield* orchestrator.getThreadProjection(threadId);
+      assert.isEmpty(
+        projection.messages.filter(
+          (message) => message.notification?.summary === "Background work stopped without a result",
+        ),
+      );
+      if (row === "replacement") {
+        assert.deepEqual(
+          projection.providerThreads
+            .find((thread) => thread.id === providerThreadId)!
+            .pendingBackgroundTasks?.map((task) => task.taskId),
+          ["b78m03be3"],
+        );
+      }
+    }).pipe(Effect.provide(layerTest)),
+);

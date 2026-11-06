@@ -1,8 +1,11 @@
+import { backgroundWorkHoldsCompletion } from "@t3tools/shared/orchestrationV2PendingBackgroundWork";
+import { removeReleasedBackgroundTasks } from "./ReleasedBackgroundRoster.ts";
 import { AgentScope } from "@t3tools/shared/AgentScope";
 import * as KeyedLock from "@t3tools/shared/KeyedLock";
 import { resolveProjectSettings } from "@t3tools/shared/projectSettings";
 import {
   isOrchestrationV2WorkActive,
+  CommandId,
   ModelSelection,
   OrchestrationV2DomainEvent,
   OrchestrationV2ProviderSession,
@@ -787,7 +790,7 @@ export const layerWithOptions = (
                 threadId,
                 providerSessionId,
                 providerThreadId: providerThread.id,
-                taskIds: new Set(tasks.map((task) => task.taskId)),
+                tasks,
               });
             }
           }
@@ -807,55 +810,58 @@ export const layerWithOptions = (
         ReturnType<typeof readReleasedBackgroundTasks>
       >[number];
 
-      // Dead processes cannot report task endings; stale rosters keep threads Waiting.
-      const writeReleasedBackgroundWorkEvents = (
-        released: ReadonlyArray<ReleasedBackgroundTasks>,
-      ) =>
-        Effect.forEach(
-          released,
-          ({ threadId, providerSessionId, providerThreadId, taskIds }) =>
-            Effect.gen(function* () {
-              for (let attempt = 0; attempt < 3; attempt++) {
-                const projection = yield* projectionStore.getThreadRecords(threadId, [
-                  "providerThreads",
-                ]);
-                const providerThread = projection.providerThreads.find(
-                  (candidate) => candidate.id === providerThreadId,
-                );
-                const tasks = providerThread?.pendingBackgroundTasks ?? [];
-                const remaining = tasks.filter((task) => !taskIds.has(task.taskId));
-                if (providerThread === undefined || remaining.length === tasks.length) return;
-                const now = yield* DateTime.now;
-                const { committed } = yield* eventSink.writeIfProviderThreadUnchanged({
-                  expected: providerThread,
-                  events: [
-                    {
-                      id: yield* idAllocator.allocate.event({ threadId, providerSessionId }),
-                      type: "provider-thread.updated",
-                      threadId,
-                      driver: providerThread.driver,
-                      providerInstanceId: providerThread.providerInstanceId,
-                      occurredAt: now,
-                      payload: {
-                        ...providerThread,
-                        pendingBackgroundTasks: remaining,
-                        updatedAt: now,
-                      },
-                    },
-                  ],
-                });
-                if (committed) return;
-              }
-              yield* Effect.logWarning(
-                "orchestration-v2.provider-session-release-roster-conflict",
+      const writeReleasedBackgroundWorkEvents = Effect.fn(
+        "ProviderSessionManager.writeReleasedBackgroundWorkEvents",
+      )(function* (input: {
+        readonly releasedBackgroundTasks: ReadonlyArray<ReleasedBackgroundTasks>;
+        readonly reason: ProviderSessionReleaseReason;
+        readonly detail?: string;
+        readonly releasedAt: DateTime.Utc;
+      }) {
+        for (const {
+          threadId,
+          providerSessionId,
+          providerThreadId,
+          tasks,
+        } of input.releasedBackgroundTasks) {
+          const taskIds = tasks.map((task) => task.taskId);
+          if (
+            (input.reason === "idle_timeout" || input.reason === "runtime_error") &&
+            backgroundWorkHoldsCompletion(tasks)
+          ) {
+            const key = `background-work-released:${providerSessionId}:${providerThreadId}:${DateTime.toEpochMillis(input.releasedAt)}`;
+            yield* eventSink.writeWithEffects({
+              events: [],
+              effects: [
                 {
-                  providerSessionId,
-                  providerThreadId,
+                  id: `effect:${key}`,
+                  commandId: CommandId.make(`command:${key}`),
+                  threadId,
+                  request: {
+                    type: "background-work.released",
+                    providerThreadId,
+                    providerSessionId,
+                    reason: input.reason,
+                    taskIds,
+                    ...(input.detail === undefined ? {} : { detail: input.detail }),
+                  },
                 },
-              );
-            }),
-          { discard: true },
-        );
+              ],
+            });
+          } else {
+            yield* removeReleasedBackgroundTasks({
+              threadId,
+              providerSessionId,
+              providerThreadId,
+              taskIds,
+            }).pipe(
+              Effect.provideService(ProjectionStore.ProjectionStoreV2, projectionStore),
+              Effect.provideService(EventSink.EventSinkV2, eventSink),
+              Effect.provideService(IdAllocator.IdAllocatorV2, idAllocator),
+            );
+          }
+        }
+      });
 
       const writeReleaseRecords = (input: {
         readonly entry: LiveSessionEntry;
@@ -875,7 +881,7 @@ export const layerWithOptions = (
                 input.entry.requestEventPermit.withPermits(1),
               ),
             ),
-            Effect.exit(writeReleasedBackgroundWorkEvents(input.releasedBackgroundTasks)),
+            Effect.exit(writeReleasedBackgroundWorkEvents(input)),
           ],
           { concurrency: 1 },
         ).pipe(Effect.flatMap(Exit.asVoidAll));

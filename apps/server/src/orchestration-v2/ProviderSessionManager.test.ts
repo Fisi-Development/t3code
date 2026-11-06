@@ -31,6 +31,8 @@ import * as Queue from "effect/Queue";
 import * as Ref from "effect/Ref";
 import * as Stream from "effect/Stream";
 import * as SqlClient from "effect/sql/SqlClient";
+import * as EffectWorker from "./EffectWorker.ts";
+import * as ProviderReplayHarness from "./testkit/ProviderReplayHarness.ts";
 import { TestClock } from "effect/testing";
 import { HttpServer } from "effect/http";
 
@@ -577,6 +579,7 @@ function layerTest(input: {
   readonly idleTimeoutMs: number;
   readonly maxIdlePinMs?: number;
   readonly failEventStream?: boolean;
+  readonly releaseRosterWritten?: Deferred.Deferred<void>;
   readonly capabilities?: OrchestrationV2ProviderCapabilities;
   readonly extensionStatuses?: OrchestrationV2ProviderSession["extensionStatuses"];
   readonly mcpConfigs?: Ref.Ref<
@@ -606,7 +609,7 @@ function layerTest(input: {
   readonly serverSettingsLayer?: ReturnType<typeof ServerSettings.layerTest>;
   readonly projectServiceLayer?: Layer.Layer<ProjectService.ProjectService>;
 }) {
-  const layerConfiguredEventSink =
+  const layerBaseConfiguredEventSink =
     input.flakyReleaseWrites !== undefined
       ? layerFlakyReleaseEventSink(input.flakyReleaseWrites)
       : input.pauseAttachWrite !== undefined
@@ -616,6 +619,39 @@ function layerTest(input: {
           : input.failReleaseEventWrites
             ? layerFailingReleaseEventSink
             : layerTestEventSink;
+  const layerConfiguredEventSink =
+    input.releaseRosterWritten === undefined
+      ? layerBaseConfiguredEventSink
+      : Layer.effect(
+          EventSink.EventSinkV2,
+          Effect.gen(function* () {
+            const delegate = yield* EventSink.EventSinkV2;
+            const recorded = input.releaseRosterWritten!;
+            return EventSink.EventSinkV2.of({
+              ...delegate,
+              writeWithEffects: (write) =>
+                delegate
+                  .writeWithEffects(write)
+                  .pipe(
+                    Effect.tap(() =>
+                      write.effects.some(
+                        (effect) => String(effect.request.type) === "background-work.released",
+                      )
+                        ? Deferred.succeed(recorded, undefined)
+                        : Effect.void,
+                    ),
+                  ),
+              writeIfProviderThreadUnchanged: (write) =>
+                delegate
+                  .writeIfProviderThreadUnchanged(write)
+                  .pipe(
+                    Effect.tap((result) =>
+                      result.committed ? Deferred.succeed(recorded, undefined) : Effect.void,
+                    ),
+                  ),
+            });
+          }),
+        ).pipe(Layer.provide(layerBaseConfiguredEventSink));
   const layerRegistry = Layer.unwrap(
     makeProviderAdapter(input.state, {
       failEventStream: input.failEventStream ?? false,
@@ -4391,6 +4427,7 @@ it.effect.each([
 ] as const)("%s", ([_name, mode, awaited]) =>
   Effect.gen(function* () {
     const state = yield* Ref.make(emptyState);
+    const releaseRosterWritten = yield* Deferred.make<void>();
     const flaky: FlakyReleaseWrites = {
       failing: yield* Ref.make<"none" | "session" | "session-and-requests">("session"),
       failures: yield* Queue.unbounded<void>(),
@@ -4454,6 +4491,7 @@ it.effect.each([
         yield* Ref.set(flaky.failing, "none");
         yield* TestClock.adjust("1 second");
       }
+      yield* Deferred.await(releaseRosterWritten);
       assert.isFalse(yield* manager.isLive(providerSessionId));
       const effects = yield* sql<{ effect_id: string; payload_json: string }>`
         SELECT effect_id, payload_json FROM orchestration_v2_effect_outbox
@@ -4471,16 +4509,54 @@ it.effect.each([
         assert.deepEqual(request.taskIds, ["b78m03be3"]);
         assert.equal(request.reason, mode === "crash" ? "runtime_error" : "idle_timeout");
       }
+      yield* (yield* EffectWorker.OrchestrationEffectWorkerV2).drain();
+      const delivered = yield* projections.getThreadProjection(threadId);
+      const notices = delivered.messages.filter(
+        (message) => message.notification?.summary === "Background work stopped without a result",
+      );
+      assert.lengthOf(notices, awaited ? 1 : 0);
+      assert.isEmpty(delivered.providerThreads[0]!.pendingBackgroundTasks ?? []);
+      if (awaited) {
+        assert.equal(
+          String(notices[0]!.id),
+          `message:${effects[0]!.effect_id.slice("effect:".length)}`,
+        );
+        assert.include(notices[0]!.text, "b78m03be3");
+        assert.include(
+          notices[0]!.text,
+          mode === "crash"
+            ? "provider process exited unexpectedly"
+            : "closed after a long time without activity",
+        );
+        yield* sql`UPDATE orchestration_v2_effect_outbox SET status = 'pending', completed_at = NULL WHERE effect_id = ${effects[0]!.effect_id}`;
+        yield* (yield* EffectWorker.OrchestrationEffectWorkerV2).drain();
+        assert.lengthOf(
+          (yield* projections.getThreadProjection(threadId)).messages.filter(
+            (message) => message.id === notices[0]!.id,
+          ),
+          1,
+        );
+      }
     }).pipe(
       Effect.provide(
-        layerTest({
-          state,
-          idleTimeoutMs: 1000,
-          maxIdlePinMs: 1000,
-          hasPendingBackgroundWork: Effect.succeed(true),
-          failEventStream: mode === "crash",
-          ...(mode === "retry" ? { flakyReleaseWrites: flaky } : {}),
-        }).pipe(Layer.provideMerge(layerTestDatabase)),
+        Layer.merge(
+          ProviderReplayHarness.layerWithRegistry(
+            { name: "released-background-notice" },
+            Layer.unwrap(
+              makeProviderAdapter(state).pipe(Effect.map(ProviderAdapterRegistry.layerSingle)),
+            ),
+            { databaseLayer: layerTestDatabase, runEffectWorker: false },
+          ),
+          layerTest({
+            state,
+            releaseRosterWritten,
+            idleTimeoutMs: 1000,
+            maxIdlePinMs: 1000,
+            hasPendingBackgroundWork: Effect.succeed(true),
+            failEventStream: mode === "crash",
+            ...(mode === "retry" ? { flakyReleaseWrites: flaky } : {}),
+          }),
+        ).pipe(Layer.provideMerge(layerTestDatabase)),
       ),
     );
   }),
