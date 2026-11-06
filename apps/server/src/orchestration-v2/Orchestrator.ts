@@ -13214,6 +13214,9 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       return;
     }
 
+    // This rule covers dedicated delivery runs; mailbox steers retain acceptance-based recovery.
+    const cancelledBeforeStart =
+      deliveryRun.status === "cancelled" && deliveryRun.startedAt === null;
     const now = yield* DateTime.now;
     const nextTaskStates = new Map<
       OrchestrationV2Subagent["id"],
@@ -13229,7 +13232,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         continue;
       }
       nextTaskStates.set(task.id, {
-        state: deliveryRun.status === "cancelled" ? "pending" : "delivered",
+        state: cancelledBeforeStart ? "pending" : "delivered",
         observedByRunId: null,
       });
     }
