@@ -328,7 +328,7 @@ describe("pull request detail decoding", () => {
   const inWorkflow = ({ workflowName, ...fields }: Record<string, unknown>) =>
     check({
       ...fields,
-      checkSuite: { workflowRun: { workflow: { name: workflowName } } },
+      checkSuite: { workflowRun: { event: "pull_request", workflow: { name: workflowName } } },
     });
 
   const coreJson = (

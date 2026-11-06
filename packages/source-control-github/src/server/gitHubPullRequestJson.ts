@@ -137,6 +137,8 @@ interface CheckFields {
   readonly targetUrl?: string | null | undefined;
   /** Empty for app-owned runs; absent for commit statuses. */
   readonly workflowName?: string | null | undefined;
+  /** The event that started the run; absent for commit statuses. */
+  readonly workflowEvent?: string | null | undefined;
   readonly startedAt?: string | null | undefined;
   readonly completedAt?: string | null | undefined;
   /** Branch protection requires this check; asked for on github.com only. */
@@ -604,6 +606,7 @@ function isNamelessCheck(raw: CheckFields): boolean {
 function toCheckEntries(raw: ReadonlyArray<CheckFields> | null | undefined): ReadonlyArray<{
   readonly check: PullRequestCheck;
   readonly workflowName: string | null;
+  readonly event: string | null;
   readonly at: string | null;
 }> {
   return (raw ?? []).flatMap((check) => {
@@ -620,6 +623,7 @@ function toCheckEntries(raw: ReadonlyArray<CheckFields> | null | undefined): Rea
           ...(typeof check.isRequired === "boolean" ? { required: check.isRequired } : {}),
         },
         workflowName: trimmed(check.workflowName),
+        event: trimmed(check.workflowEvent),
         at:
           status === "pending"
             ? STILL_RUNNING
@@ -642,10 +646,48 @@ function rollupChecksState(
   return statuses.includes("success") ? "passing" : null;
 }
 
+/** Worse first; a run cancelled next to a finished one is not a failure of the check. */
+const CHECK_RANK: Record<PullRequestCheckStatus, number> = {
+  failure: 6,
+  "action-required": 5,
+  pending: 4,
+  success: 3,
+  neutral: 2,
+  skipped: 1,
+  cancelled: 0,
+};
+
 function toChecks(
   raw: ReadonlyArray<CheckFields> | null | undefined,
 ): ReadonlyArray<PullRequestCheck> {
-  return dedupeChecks(toCheckEntries(raw));
+  type Entry = ReturnType<typeof toCheckEntries>[number];
+  // Runs of one check started by different events (push and pull_request) are independent, so
+  // each event keeps its newest run and the check reports the worse of them.
+  const byRun = new Map<string, Array<Entry>>();
+  for (const entry of toCheckEntries(raw)) {
+    const key = JSON.stringify([entry.workflowName ?? "", entry.check.name, entry.event ?? ""]);
+    byRun.set(key, [...(byRun.get(key) ?? []), entry]);
+  }
+  const byCheck = new Map<string, Entry>();
+  for (const runs of byRun.values()) {
+    const newest = dedupeChecks(runs)[0];
+    if (newest === undefined) continue;
+    const entry = { ...runs[0]!, check: newest };
+    const key = JSON.stringify([entry.workflowName ?? "", newest.name]);
+    const kept = byCheck.get(key);
+    if (kept === undefined) {
+      byCheck.set(key, entry);
+      continue;
+    }
+    const chosen = CHECK_RANK[newest.status] > CHECK_RANK[kept.check.status] ? entry : kept;
+    byCheck.set(
+      key,
+      kept.check.required === true || newest.required === true
+        ? { ...chosen, check: { ...chosen.check, required: true } }
+        : chosen,
+    );
+  }
+  return dedupeChecks([...byCheck.values()]);
 }
 
 function isReviewVerdict(reviewState: string | null): boolean {
@@ -1185,7 +1227,11 @@ export type GitHubCheckContext = CheckFields;
 function toCheckContexts(nodes: ReadonlyArray<CheckContext>): ReadonlyArray<GitHubCheckContext> {
   return nodes.map((check) =>
     check.__typename === "CheckRun"
-      ? { ...check, workflowName: check.checkSuite.workflowRun?.workflow.name ?? null }
+      ? {
+          ...check,
+          workflowName: check.checkSuite.workflowRun?.workflow.name ?? null,
+          workflowEvent: check.checkSuite.workflowRun?.event ?? null,
+        }
       : check,
   );
 }
