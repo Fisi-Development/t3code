@@ -23,6 +23,8 @@ import * as Context from "effect/Context";
 import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
+import * as Fiber from "effect/Fiber";
+import * as TestClock from "effect/testing/TestClock";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Queue from "effect/Queue";
@@ -540,6 +542,10 @@ const makeLaptop = (
   >,
   /** The laptop's links from before a restart, which keep their sessions there. */
   kept?: Context.Context<Layer.Success<ReturnType<typeof layerLinkingEnvironment>>>,
+  wrapWait: (
+    wait: PeerForwarding.PeerForwarding["Service"]["waitForThread"],
+  ) => PeerForwarding.PeerForwarding["Service"]["waitForThread"] = (wait) => wait,
+  follower?: Deferred.Deferred<Fiber.Fiber<unknown, unknown>>,
 ) =>
   Effect.gen(function* () {
     const linking = kept ?? (yield* layerLinkingEnvironment(laptop).pipe(Layer.build));
@@ -560,7 +566,20 @@ const makeLaptop = (
         }),
       ),
     );
-    const layerThreads = ThreadManagement.layer.pipe(
+    const layerThreads = Layer.effect(
+      ThreadManagement.ThreadManagementService,
+      Effect.gen(function* () {
+        const threads = yield* ThreadManagement.ThreadManagementService;
+        return {
+          ...threads,
+          getThreadEventSequence: (threadId) =>
+            Effect.withFiber((fiber) =>
+              follower === undefined ? Effect.void : Deferred.succeed(follower, fiber),
+            ).pipe(Effect.andThen(threads.getThreadEventSequence(threadId))),
+        } satisfies ThreadManagement.ThreadManagementService["Service"];
+      }),
+    ).pipe(
+      Layer.provide(ThreadManagement.layer),
       Layer.provide(CommandReceiptStore.layer.pipe(Layer.provide(layerDatabase))),
       Layer.provideMerge(Layer.merge(layerOrchestrator, ServerSettings.layerTest())),
     );
@@ -568,7 +587,15 @@ const makeLaptop = (
       Layer.provideMerge(McpHttpServer.layerInProcessMcpServer),
       Layer.provideMerge(
         RemoteDelegation.layer.pipe(
-          Layer.provideMerge(PeerForwarding.layer),
+          Layer.provideMerge(
+            Layer.effect(
+              PeerForwarding.PeerForwarding,
+              Effect.gen(function* () {
+                const forwarding = yield* PeerForwarding.PeerForwarding;
+                return { ...forwarding, waitForThread: wrapWait(forwarding.waitForThread) };
+              }),
+            ).pipe(Layer.provide(PeerForwarding.layer)),
+          ),
           Layer.provide(
             Layer.mock(ProjectService.ProjectService)({
               // A cold enrichment cache: the project itself reports no identity yet.
@@ -1805,6 +1832,127 @@ it.effect("a Stop on a task that has its result reaches there after a restart", 
       yield* after.remote.start();
       expect(yield* stoppedThere(after, delegated.taskId)).toMatchObject({ status: "completed" });
       expect(yield* Ref.get(thread.stops)).toEqual(["thread.stop", "delegated-tasks"]);
+    }),
+  ).pipe(Effect.provide(NodeHttpServer.layerTest)),
+);
+
+it.effect("D6_follower_whose_retries_end_fails_the_task_and_wakes_the_parent", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const thread = yield* makeBoxThread;
+      const b = yield* serveBox(thread);
+      const offers = yield* SubscriptionRef.make<
+        ReadonlyArray<ProviderContinuationRequests.ProviderContinuationRequest>
+      >([]);
+      const database = yield* SqlitePersistence.layerMemory.pipe(Layer.build);
+      const follower = yield* Deferred.make<Fiber.Fiber<unknown, unknown>>();
+      const a = yield* makeLaptop(database, offers, undefined, undefined, follower).pipe(
+        Effect.provideService(RemoteDelegation.FollowRetrySchedule, Schedule.recurs(2)),
+      );
+      yield* linkTo(a.links, b, "full-access");
+      yield* seedParent(a);
+      yield* Ref.set(
+        thread.afterLaunch,
+        Ref.set(b.descriptor, descriptorOf("environment-elsewhere", "Elsewhere")),
+      );
+      const delegated = yield* delegateToBox(a);
+      const fiber = yield* Deferred.await(follower);
+      yield* TestClock.adjust("3 seconds");
+      yield* Fiber.await(fiber);
+      const task = (yield* a.orchestrator.getThreadProjection(parentThreadId)).subagents.find(
+        (task) => task.id === delegated.taskId,
+      );
+      expect(task?.status).toBe("failed");
+      expect(task?.result).toContain("stopped following the task");
+      expect(task?.result).toContain(delegated.remoteChild.threadId);
+      const parentRun = (yield* a.orchestrator.getThreadProjection(parentThreadId)).runs.find(
+        (run) => run.id === parentRunId,
+      );
+      expect(parentRun?.delegatedCompletion?.delivery?.taskIds).toEqual([delegated.taskId]);
+      const offered = yield* SubscriptionRef.changes(offers).pipe(
+        Stream.filter((seen) => seen.some((offer) => offer.threadId === parentThreadId)),
+        Stream.runHead,
+      );
+      expect(Option.isSome(offered)).toBe(true);
+    }),
+  ).pipe(Effect.provide(NodeHttpServer.layerTest)),
+);
+
+it.effect("D6_follower_defect_is_retried_not_dropped", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const thread = yield* makeBoxThread;
+      const b = yield* serveBox(thread);
+      const offers = yield* SubscriptionRef.make<
+        ReadonlyArray<ProviderContinuationRequests.ProviderContinuationRequest>
+      >([]);
+      const database = yield* SqlitePersistence.layerMemory.pipe(Layer.build);
+      const follower = yield* Deferred.make<Fiber.Fiber<unknown, unknown>>();
+      const attempts = yield* Ref.make(0);
+      const a = yield* makeLaptop(
+        database,
+        offers,
+        undefined,
+        (wait) =>
+          (...args) =>
+            Ref.updateAndGet(attempts, (count) => count + 1).pipe(
+              Effect.flatMap((count) =>
+                count === 1 ? Effect.die(new Error("boom")) : wait(...args),
+              ),
+            ),
+        follower,
+      ).pipe(Effect.provideService(RemoteDelegation.FollowRetrySchedule, Schedule.recurs(2)));
+      yield* linkTo(a.links, b, "full-access");
+      yield* seedParent(a);
+      yield* Ref.set(thread.status, "completed");
+      yield* Ref.set(thread.reply, "Recovered after boom.");
+      yield* Deferred.succeed(thread.finished, undefined);
+      const delegated = yield* delegateToBox(a);
+      yield* TestClock.adjust("1 second");
+      yield* Fiber.await(yield* Deferred.await(follower));
+      const task = (yield* a.orchestrator.getThreadProjection(parentThreadId)).subagents.find(
+        (task) => task.id === delegated.taskId,
+      );
+      expect(task?.status).toBe("completed");
+      expect(task?.result).toBe("Recovered after boom.");
+    }),
+  ).pipe(Effect.provide(NodeHttpServer.layerTest)),
+);
+
+it.effect("D6_follower_repeated_defects_fail_the_task", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const thread = yield* makeBoxThread;
+      const b = yield* serveBox(thread);
+      const offers = yield* SubscriptionRef.make<
+        ReadonlyArray<ProviderContinuationRequests.ProviderContinuationRequest>
+      >([]);
+      const database = yield* SqlitePersistence.layerMemory.pipe(Layer.build);
+      const follower = yield* Deferred.make<Fiber.Fiber<unknown, unknown>>();
+      const attempts = yield* Ref.make(0);
+      const a = yield* makeLaptop(
+        database,
+        offers,
+        undefined,
+        () => () =>
+          Ref.update(attempts, (count) => count + 1).pipe(
+            Effect.andThen(Effect.die(new Error("boom"))),
+          ),
+        follower,
+      ).pipe(Effect.provideService(RemoteDelegation.FollowRetrySchedule, Schedule.forever));
+      yield* linkTo(a.links, b, "full-access");
+      yield* seedParent(a);
+      const delegated = yield* delegateToBox(a);
+      yield* TestClock.adjust("1 second");
+      yield* Fiber.await(yield* Deferred.await(follower));
+      const task = (yield* a.orchestrator.getThreadProjection(parentThreadId)).subagents.find(
+        (task) => task.id === delegated.taskId,
+      );
+      expect(task?.status).toBe("failed");
+      expect(yield* Ref.get(attempts)).toBe(3);
+      expect(task?.result).toContain("stopped following the task");
+      expect(task?.result).toContain("boom");
+      expect(task?.result).toContain(delegated.remoteChild.threadId);
     }),
   ).pipe(Effect.provide(NodeHttpServer.layerTest)),
 );
