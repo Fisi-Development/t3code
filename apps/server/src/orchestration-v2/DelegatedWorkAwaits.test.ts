@@ -13,7 +13,7 @@ import * as Layer from "effect/Layer";
 import * as ServerDelegatedWorkAwaits from "./DelegatedWorkAwaits.ts";
 import * as ProjectionStore from "./ProjectionStore.ts";
 
-it.effect("D7_waits_only_for_delegated_tasks_that_will_wake_the_parent", () =>
+it.effect("a goal waits only for delegated tasks that will wake its thread", () =>
   Effect.gen(function* () {
     const threadId = ThreadId.make("parent");
     const now = yield* DateTime.now;

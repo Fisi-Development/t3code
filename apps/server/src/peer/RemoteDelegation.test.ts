@@ -859,9 +859,9 @@ const followUpWaiter =
 it.effect.each([
   {
     restart: false,
-    name: "D5_linked_child_reply_after_its_result_wakes_the_parent_as_a_follow_up",
+    name: "a linked child that replies again after its result wakes the parent with a follow-up",
   },
-  { restart: true, name: "D5_follow_up_watch_survives_a_restart" },
+  { restart: true, name: "the follow-up watch on a linked task survives a restart" },
 ])("$name", ({ restart }) =>
   Effect.scoped(
     Effect.gen(function* () {
@@ -943,7 +943,7 @@ it.effect.each([
   ).pipe(Effect.provide(NodeHttpServer.layerTest)),
 );
 
-it.effect("D5_follow_up_watch_ends_after_its_window", () =>
+it.effect("the follow-up watch on a linked task ends after its window", () =>
   Effect.scoped(
     Effect.gen(function* () {
       const thread = yield* makeBoxThread;
@@ -1994,7 +1994,7 @@ it.effect("a Stop on a task that has its result reaches there after a restart", 
   ).pipe(Effect.provide(NodeHttpServer.layerTest)),
 );
 
-it.effect("D6_follower_whose_retries_end_fails_the_task_and_wakes_the_parent", () =>
+it.effect("a follower whose retries end fails the task and wakes the parent", () =>
   Effect.scoped(
     Effect.gen(function* () {
       const thread = yield* makeBoxThread;
@@ -2036,7 +2036,7 @@ it.effect("D6_follower_whose_retries_end_fails_the_task_and_wakes_the_parent", (
   ).pipe(Effect.provide(NodeHttpServer.layerTest)),
 );
 
-it.effect("D6_follower_defect_is_retried_not_dropped", () =>
+it.effect("a follower that hits a defect retries instead of dropping the task", () =>
   Effect.scoped(
     Effect.gen(function* () {
       const thread = yield* makeBoxThread;
@@ -2077,7 +2077,7 @@ it.effect("D6_follower_defect_is_retried_not_dropped", () =>
   ).pipe(Effect.provide(NodeHttpServer.layerTest)),
 );
 
-it.effect("D6_follower_repeated_defects_fail_the_task", () =>
+it.effect("a follower that keeps hitting defects fails the task", () =>
   Effect.scoped(
     Effect.gen(function* () {
       const thread = yield* makeBoxThread;

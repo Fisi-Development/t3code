@@ -1968,14 +1968,14 @@ it.layer(Layer.merge(layerTest, ProviderContinuationRequests.layer))(
         repeat: false,
         parentSend: false,
       },
-      { name: "D4_follow_up_wake_names_the_task_it_follows", repeat: false, parentSend: false },
+      { name: "a follow-up wake names the task it follows", repeat: false, parentSend: false },
       {
-        name: "D8_follow_up_repeating_the_last_result_does_not_wake_the_parent",
+        name: "a follow-up repeating the last result does not wake the parent",
         repeat: true,
         parentSend: false,
       },
       {
-        name: "D8_parent_sent_follow_up_with_the_same_reply_still_wakes",
+        name: "a follow-up the parent asked for still wakes it with the same reply",
         repeat: true,
         parentSend: true,
       },

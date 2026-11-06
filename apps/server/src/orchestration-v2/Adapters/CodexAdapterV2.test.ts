@@ -8622,14 +8622,15 @@ describe("CodexAdapterV2 post-settle continuation", () => {
         ),
       );
 
-    it.effect("D7_goal_turn_does_not_continue_while_a_delegated_task_will_wake_the_parent", () =>
-      delegatedGoalWait(false),
+    it.effect(
+      "an active goal does not keep turning while a delegated task will wake the thread",
+      () => delegatedGoalWait(false),
     );
-    it.effect("D7_next_turn_resumes_a_goal_paused_for_delegated_work", () =>
+    it.effect("the next turn resumes a goal paused for delegated work", () =>
       delegatedGoalWait(true),
     );
 
-    it.effect("D7_goal_still_continues_when_no_delegated_work_is_pending", () =>
+    it.effect("an active goal still continues when no delegated work is pending", () =>
       Effect.gen(function* () {
         const transcript = makeCodexReplayTranscript({
           scenario: "goal-continuation",
