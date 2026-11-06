@@ -25,6 +25,7 @@ import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/sql/SqlClient";
 import * as Stream from "effect/Stream";
 import * as EventStore from "./EventStore.ts";
+import { backgroundWorkHoldsCompletion } from "@t3tools/shared/orchestrationV2PendingBackgroundWork";
 import * as TestClock from "effect/testing/TestClock";
 
 import * as SqlitePersistence from "../persistence/Sqlite.ts";
@@ -1741,4 +1742,161 @@ it.effect.each(["Stop", "Force stop"] as const)(
         "the stopped run has no interrupt result",
       );
     }).pipe(Effect.provide(layerTest)),
+);
+
+const waitingBackgroundFixture = Effect.fn("test.waitingBackgroundFixture")(function* (
+  label: string,
+  awaited: boolean,
+) {
+  const orchestrator = yield* Orchestrator.OrchestratorV2;
+  const projections = yield* ProjectionStore.ProjectionStoreV2;
+  const threadId = ThreadId.make(`thread:background:${label}`);
+  yield* createWatchingThread(threadId, 42);
+  yield* send(threadId, "work", "start_immediately");
+  const projection = yield* orchestrator.getThreadProjection(threadId);
+  const run = projection.runs[0]!;
+  const now = yield* DateTime.now;
+  const providerSessionId = ProviderSessionId.make(`session:${label}`);
+  const providerThreadId = run.providerThreadId!;
+  yield* projections.apply({
+    id: EventId.make(`event:completed:${label}`),
+    type: "run.updated",
+    threadId,
+    occurredAt: now,
+    payload: { ...run, status: "completed", providerThreadId, startedAt: now, completedAt: now },
+  });
+  yield* projections.apply({
+    id: EventId.make(`event:roster:${label}`),
+    type: "provider-thread.updated",
+    threadId,
+    occurredAt: now,
+    payload: {
+      id: providerThreadId,
+      driver: adapter.driver,
+      providerInstanceId: instanceId,
+      providerSessionId,
+      appThreadId: threadId,
+      ownerNodeId: null,
+      nativeThreadRef: null,
+      nativeConversationHeadRef: null,
+      status: "idle",
+      firstRunOrdinal: run.ordinal,
+      lastRunOrdinal: run.ordinal,
+      handoffIds: [],
+      forkedFrom: null,
+      pendingBackgroundTasks: [
+        { taskId: "b78m03be3", kind: "command", ...(awaited ? { awaited: true as const } : {}) },
+      ],
+      createdAt: now,
+      updatedAt: now,
+    },
+  });
+  yield* projections.apply({
+    id: EventId.make(`event:session:${label}`),
+    type: "provider-session.attached",
+    threadId,
+    occurredAt: now,
+    payload: {
+      id: providerSessionId,
+      driver: adapter.driver,
+      providerInstanceId: instanceId,
+      status: "ready",
+      cwd: process.cwd(),
+      model: modelSelection.model,
+      capabilities: CodexProviderCapabilitiesV2,
+      createdAt: now,
+      updatedAt: now,
+      lastError: null,
+    },
+  });
+  yield* projections.apply({
+    id: EventId.make(`event:turn:${label}`),
+    type: "provider-turn.updated",
+    threadId,
+    occurredAt: now,
+    payload: {
+      id: ProviderTurnId.make(`turn:${label}`),
+      providerThreadId,
+      nodeId: run.rootNodeId!,
+      runAttemptId: run.activeAttemptId!,
+      nativeTurnRef: null,
+      ordinal: 1,
+      status: "completed",
+      startedAt: now,
+      completedAt: now,
+    },
+  });
+  return { threadId, providerThreadId, providerSessionId };
+});
+
+it.effect.each(["awaited", "dev-server control", "PR-watch control"])(
+  "R1 settle refuses a thread waiting on an awaited background command (%s)",
+  (row) =>
+    Effect.gen(function* () {
+      const orchestrator = yield* Orchestrator.OrchestratorV2;
+      const projections = yield* ProjectionStore.ProjectionStoreV2;
+      const { threadId, providerThreadId } = yield* waitingBackgroundFixture(
+        row,
+        row === "awaited",
+      );
+      if (row === "PR-watch control") {
+        const providerThread = (yield* projections.getThreadRecords(threadId, [
+          "providerThreads",
+        ])).providerThreads.find((thread) => thread.id === providerThreadId)!;
+        yield* projections.apply({
+          id: EventId.make("event:only-watch"),
+          type: "provider-thread.updated",
+          threadId,
+          occurredAt: yield* DateTime.now,
+          payload: { ...providerThread, pendingBackgroundTasks: [] },
+        });
+      }
+      const result = yield* Effect.exit(
+        orchestrator.dispatch({
+          type: "thread.settle",
+          commandId: CommandId.make(`settle:${row}`),
+          threadId,
+        }),
+      );
+      if (row === "awaited") {
+        assert.isTrue(Exit.isFailure(result), "settle must reject awaited background work");
+        if (Exit.isFailure(result))
+          assert.include(
+            String(result.cause),
+            `Thread ${threadId} is waiting on background work. Stop it before settling.`,
+          );
+      } else assert.isTrue(Exit.isSuccess(result));
+      const sql = yield* SqlClient.SqlClient;
+      const detach = yield* sql`SELECT effect_id FROM orchestration_v2_effect_outbox
+      WHERE thread_id = ${threadId} AND effect_type = 'provider-session.detach'`;
+      assert.lengthOf(detach, row === "awaited" ? 0 : 1);
+    }).pipe(Effect.provide(layerTest)),
+);
+
+it.effect("R1 settle succeeds after Stop clears the wait (control)", () =>
+  Effect.gen(function* () {
+    const orchestrator = yield* Orchestrator.OrchestratorV2;
+    const { threadId } = yield* waitingBackgroundFixture("stop-control", true);
+    yield* orchestrator.dispatch({
+      type: "thread.stop",
+      commandId: CommandId.make("stop-control"),
+      threadId,
+    });
+    yield* (yield* EffectWorker.OrchestrationEffectWorkerV2).drain();
+    const stopped = yield* orchestrator.getThreadProjection(threadId);
+    assert.isFalse(
+      backgroundWorkHoldsCompletion(
+        stopped.providerThreads.flatMap((thread) => thread.pendingBackgroundTasks ?? []),
+      ),
+    );
+    yield* orchestrator.dispatch({
+      type: "thread.settle",
+      commandId: CommandId.make("settle-after-stop"),
+      threadId,
+    });
+    assert.equal(
+      (yield* orchestrator.getThreadProjection(threadId)).thread.settledOverride,
+      "settled",
+    );
+  }).pipe(Effect.provide(layerTest)),
 );

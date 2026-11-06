@@ -30,6 +30,7 @@ import * as Option from "effect/Option";
 import * as Queue from "effect/Queue";
 import * as Ref from "effect/Ref";
 import * as Stream from "effect/Stream";
+import * as SqlClient from "effect/sql/SqlClient";
 import { TestClock } from "effect/testing";
 import { HttpServer } from "effect/http";
 
@@ -4375,5 +4376,112 @@ it.effect("ProviderSessionManagerV2 gives a delegated child its project's device
       delegatedBy: ThreadId.make("thread-provider-session-manager-parent"),
     });
     assert.isTrue(child?.capabilities?.has("device"));
+  }),
+);
+
+it.effect.each([
+  ["R5 idle release of a session past its pin delivers one notice", "idle", true],
+  [
+    "R5 provider process exit delivers one notice to a thread waiting on background work",
+    "crash",
+    true,
+  ],
+  ["R5 a retried release record delivers one notice", "retry", true],
+  ["R5 unawaited background work is released quietly (control)", "idle", false],
+] as const)("%s", ([_name, mode, awaited]) =>
+  Effect.gen(function* () {
+    const state = yield* Ref.make(emptyState);
+    const flaky: FlakyReleaseWrites = {
+      failing: yield* Ref.make<"none" | "session" | "session-and-requests">("session"),
+      failures: yield* Queue.unbounded<void>(),
+    };
+    yield* Effect.gen(function* () {
+      const manager = yield* ProviderSessionManager.ProviderSessionManagerV2;
+      const eventSink = yield* EventSink.EventSinkV2;
+      const idAllocator = yield* IdAllocator.IdAllocatorV2;
+      const projections = yield* ProjectionStore.ProjectionStoreV2;
+      const sql = yield* SqlClient.SqlClient;
+      const now = yield* DateTime.now;
+      const threadId = ThreadId.make("thread:released-notice");
+      const providerSessionId = yield* idAllocator.allocate.providerSession({
+        providerInstanceId: modelSelection.instanceId,
+        threadId,
+      });
+      const providerThread = {
+        ...makeProviderThread({ idAllocator, threadId, providerSessionId, now }),
+        pendingBackgroundTasks: [
+          {
+            taskId: "b78m03be3",
+            kind: "command" as const,
+            ...(awaited ? { awaited: true as const } : {}),
+          },
+        ],
+      };
+      yield* eventSink.write({
+        events: [
+          yield* makeThreadCreatedEvent({ idAllocator, threadId, now }),
+          {
+            id: yield* idAllocator.allocate.event({ threadId }),
+            type: "provider-thread.updated",
+            threadId,
+            occurredAt: now,
+            payload: providerThread,
+          },
+        ],
+      });
+      const afterSequence = yield* eventSink.latestSequence({ threadId });
+      yield* manager.open({ threadId, providerSessionId, modelSelection, runtimePolicy });
+      if (mode === "idle") {
+        yield* TestClock.adjust("3 seconds");
+      } else if (mode === "crash") {
+        yield* eventSink
+          .stream({ threadId, afterSequence, eventType: "provider-session.updated" })
+          .pipe(
+            Stream.filter(
+              (stored) =>
+                stored.event.type === "provider-session.updated" &&
+                stored.event.payload.status === "error",
+            ),
+            Stream.runHead,
+          );
+      } else {
+        assert.isTrue(
+          Exit.isFailure(
+            yield* Effect.exit(manager.release({ providerSessionId, reason: "idle_timeout" })),
+          ),
+        );
+        yield* Queue.take(flaky.failures);
+        yield* Ref.set(flaky.failing, "none");
+        yield* TestClock.adjust("1 second");
+      }
+      assert.isFalse(yield* manager.isLive(providerSessionId));
+      const effects = yield* sql<{ effect_id: string; payload_json: string }>`
+        SELECT effect_id, payload_json FROM orchestration_v2_effect_outbox
+        WHERE thread_id = ${threadId} AND effect_type = 'background-work.released'`;
+      assert.lengthOf(effects, awaited ? 1 : 0, "awaited release must persist one notice effect");
+      const roster =
+        (yield* projections.getThreadRecords(threadId, ["providerThreads"])).providerThreads[0]!
+          .pendingBackgroundTasks ?? [];
+      assert.deepEqual(
+        roster.map((task) => task.taskId),
+        awaited ? ["b78m03be3"] : [],
+      );
+      if (awaited) {
+        const request = JSON.parse(effects[0]!.payload_json);
+        assert.deepEqual(request.taskIds, ["b78m03be3"]);
+        assert.equal(request.reason, mode === "crash" ? "runtime_error" : "idle_timeout");
+      }
+    }).pipe(
+      Effect.provide(
+        layerTest({
+          state,
+          idleTimeoutMs: 1000,
+          maxIdlePinMs: 1000,
+          hasPendingBackgroundWork: Effect.succeed(true),
+          failEventStream: mode === "crash",
+          ...(mode === "retry" ? { flakyReleaseWrites: flaky } : {}),
+        }).pipe(Layer.provideMerge(layerTestDatabase)),
+      ),
+    );
   }),
 );
