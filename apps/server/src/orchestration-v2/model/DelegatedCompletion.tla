@@ -17,7 +17,8 @@ CONSTANTS
     Remote,       \* the child runs in a linked environment
     GoalActive,   \* the parent has an active Codex goal
     MaxFollowUps, \* how many times the child may wake itself after its result
-    MaxRetries    \* a finite follower retry schedule
+    MaxRetries,   \* a finite follower retry schedule
+    RunCutAfterTake \* a delivery run can be cancelled after the provider took it (a restart)
 
 VARIABLES
     child,      \* "running" | "resulted"
@@ -28,9 +29,10 @@ VARIABLES
     follower,   \* "alive" | "dead" | "done" (linked tasks only)
     retries,    \* failures the follower has retried
     recorded,   \* T0 has its result in this environment
-    spins       \* parent turns started by the goal while T0 was outstanding
+    spins,      \* parent turns started by the goal while T0 was outstanding
+    produced    \* the version of the child's latest reply
 
-vars == <<child, wakes, lastText, pending, consumed, follower, retries, recorded, spins>>
+vars == <<child, wakes, lastText, pending, consumed, follower, retries, recorded, spins, produced>>
 
 \* A delivery: the task it names, the follow-up's original (or "none"), the
 \* result version, its generation, and whether it carries news.
@@ -46,6 +48,7 @@ Init ==
     /\ retries = 0
     /\ recorded = FALSE
     /\ spins = 0
+    /\ produced = 0
 
 Outstanding == ~\E i \in 1..Len(consumed) : consumed[i].task = "T0"
 
@@ -54,6 +57,7 @@ Outstanding == ~\E i \in 1..Len(consumed) : consumed[i].task = "T0"
 ChildFinishes ==
     /\ child = "running"
     /\ child' = "resulted"
+    /\ produced' = 1
     /\ IF Remote
          THEN UNCHANGED <<pending, recorded, lastText>>
          ELSE /\ recorded' = TRUE
@@ -68,7 +72,7 @@ FollowerReads ==
     /\ lastText' = 1
     /\ follower' = "done"
     /\ pending' = pending \cup {Msg("T0", "none", 1, 1)}
-    /\ UNCHANGED <<child, wakes, consumed, retries, spins>>
+    /\ UNCHANGED <<child, wakes, consumed, retries, spins, produced>>
 
 (* The other machine asleep or a dropped route: a failure, retried.        *)
 FollowerFails ==
@@ -78,15 +82,15 @@ FollowerFails ==
               /\ UNCHANGED <<follower, pending, recorded, lastText>>
          ELSE \* The retry schedule ended.
               IF Fixed
-                THEN /\ follower' = "done"
+                THEN \* T0 fails with "stopped following"; version 0 is not a reply.
+                     /\ follower' = "gaveUp"
                      /\ recorded' = TRUE
-                     /\ lastText' = 1
-                     /\ pending' = pending \cup {Msg("T0", "none", 1, 1)}
-                     /\ UNCHANGED retries
+                     /\ pending' = pending \cup {Msg("T0", "none", 0, 1)}
+                     /\ UNCHANGED <<retries, lastText>>
                 ELSE \* Effect.ignoreCause({ log: true }): logged and dropped.
                      /\ follower' = "dead"
                      /\ UNCHANGED <<retries, pending, recorded, lastText>>
-    /\ UNCHANGED <<child, wakes, consumed, spins>>
+    /\ UNCHANGED <<child, wakes, consumed, spins, produced>>
 
 (* A defect inside a follow attempt. Effect.retry does not retry defects.  *)
 FollowerDies ==
@@ -96,23 +100,28 @@ FollowerDies ==
               /\ UNCHANGED follower
          ELSE /\ follower' = "dead"
               /\ UNCHANGED retries
-    /\ UNCHANGED <<child, wakes, pending, consumed, recorded, lastText, spins>>
+    /\ UNCHANGED <<child, wakes, pending, consumed, recorded, lastText, spins, produced>>
 
 (* The child wakes on its own background work after its result and replies *)
 (* again, with the same text (sameText) or a revised one. Since upstream    *)
-(* #23542 this starts a follow-up task Fn that wakes the parent.            *)
+(* #23542 a local child's wake starts a follow-up task Fn that wakes the   *)
+(* parent; a linked child's reply after its result reaches no one (D5).    *)
 ChildWakesItself(sameText) ==
-    /\ recorded /\ wakes < MaxFollowUps
+    /\ recorded /\ child = "resulted" /\ wakes < MaxFollowUps
     /\ wakes' = wakes + 1
     /\ LET ver == IF sameText THEN lastText ELSE lastText + 1
            task == IF wakes' = 1 THEN "F1" ELSE "F2"
-       IN IF Fixed
-            THEN IF sameText
-                   THEN UNCHANGED <<pending, lastText>>
-                   ELSE /\ pending' = pending \cup {Msg(task, "T0", ver, 1)}
-                        /\ lastText' = ver
-            ELSE /\ pending' = pending \cup {Msg(task, "none", ver, 1)}
-                 /\ lastText' = ver
+       IN /\ produced' = ver
+          /\ IF Fixed
+               THEN IF sameText
+                      THEN UNCHANGED <<pending, lastText>>
+                      ELSE /\ pending' = pending \cup {Msg(task, "T0", ver, 1)}
+                           /\ lastText' = ver
+               ELSE IF Remote
+                      \* Nothing follows the thread there once T0 has its result.
+                      THEN UNCHANGED <<pending, lastText>>
+                      ELSE /\ pending' = pending \cup {Msg(task, "none", ver, 1)}
+                           /\ lastText' = ver
     /\ UNCHANGED <<child, consumed, follower, retries, recorded, spins>>
 
 (* A delivery run cancelled before the provider took its input: the cohort *)
@@ -120,14 +129,26 @@ ChildWakesItself(sameText) ==
 DeliveryRunCancelled(m) ==
     /\ m \in pending /\ m.gen < 2
     /\ pending' = (pending \ {m}) \cup {[m EXCEPT !.gen = m.gen + 1]}
-    /\ UNCHANGED <<child, wakes, lastText, consumed, follower, retries, recorded, spins>>
+    /\ UNCHANGED <<child, wakes, lastText, consumed, follower, retries, recorded, spins, produced>>
+
+(* A delivery run cancelled after the provider took its input, for example *)
+(* by a server restart. Before the change Orchestrator.ts re-armed every    *)
+(* cancelled delivery run; after, only one whose run never started.         *)
+CancelledAfterTake(i) ==
+    /\ RunCutAfterTake /\ ~Fixed
+    /\ consumed[i].gen < 2
+    /\ ~\E j \in 1..Len(consumed) :
+           consumed[j].task = consumed[i].task /\ consumed[j].gen > consumed[i].gen
+    /\ [consumed[i] EXCEPT !.gen = consumed[i].gen + 1] \notin pending
+    /\ pending' = pending \cup {[consumed[i] EXCEPT !.gen = consumed[i].gen + 1]}
+    /\ UNCHANGED <<child, wakes, lastText, consumed, follower, retries, recorded, spins, produced>>
 
 (* The parent's provider takes the delivery's input.                       *)
 ParentTakes(m) ==
     /\ m \in pending
     /\ pending' = pending \ {m}
     /\ consumed' = Append(consumed, m)
-    /\ UNCHANGED <<child, wakes, lastText, follower, retries, recorded, spins>>
+    /\ UNCHANGED <<child, wakes, lastText, follower, retries, recorded, spins, produced>>
 
 (* Codex starts another goal turn after the parent's turn ends. Before the  *)
 (* change T3 adopts it into the run; after, T3 pauses the goal while the    *)
@@ -136,7 +157,7 @@ GoalTurn ==
     /\ GoalActive /\ Outstanding /\ pending = {} /\ spins < 3
     /\ ~Fixed
     /\ spins' = spins + 1
-    /\ UNCHANGED <<child, wakes, lastText, pending, consumed, follower, retries, recorded>>
+    /\ UNCHANGED <<child, wakes, lastText, pending, consumed, follower, retries, recorded, produced>>
 
 Next ==
     \/ ChildFinishes
@@ -146,13 +167,14 @@ Next ==
     \/ \E s \in BOOLEAN : ChildWakesItself(s)
     \/ \E m \in pending : DeliveryRunCancelled(m) \/ ParentTakes(m)
     \/ GoalTurn
+    \/ \E i \in 1..Len(consumed) : CancelledAfterTake(i)
     \/ UNCHANGED vars  \* a finished wait stays finished
 
 Spec ==
     /\ Init /\ [][Next]_vars
     /\ WF_vars(ChildFinishes)
     /\ WF_vars(FollowerReads)
-    /\ \A m \in [task : {"T0", "F1", "F2"}, of : {"T0", "none"}, ver : 1..3, gen : 1..2] :
+    /\ \A m \in [task : {"T0", "F1", "F2"}, of : {"T0", "none"}, ver : 0..3, gen : 1..2] :
            WF_vars(ParentTakes(m))
 
 -----------------------------------------------------------------------------
@@ -160,6 +182,7 @@ Spec ==
 
 \* D2, D3: one delivery per awaited event at the consumer. A re-armed
 \* generation replaces a run the provider never took, so the model sees it once.
+\* D8 (restart case), D9: a run cut after the provider took it must not re-arm.
 OneWakePerEvent ==
     \A i, j \in 1..Len(consumed) :
         i # j => ~(consumed[i].task = consumed[j].task /\ consumed[i].ver = consumed[j].ver)
@@ -181,8 +204,16 @@ NoGoalSpin == spins = 0
 \* D5, D6: every wait reaches exactly one delivered terminal outcome.
 TerminalDelivered == <>(~Outstanding)
 
+\* D5: the child's latest reply reaches the parent, also when the child
+\* replies again after its result in a linked environment.
+SeenVersion == IF consumed = <<>> THEN 0
+               ELSE LET vs == {consumed[i].ver : i \in 1..Len(consumed)}
+                    IN CHOOSE v \in vs : \A w \in vs : v >= w
+\* A follower that gave up told the parent where to read the thread there.
+LatestReplyDelivered == <>[](SeenVersion = produced \/ follower = "gaveUp")
+
 TypeOK ==
     /\ child \in {"running", "resulted"}
-    /\ follower \in {"alive", "dead", "done"}
+    /\ follower \in {"alive", "dead", "done", "gaveUp"}
     /\ retries \in 0..MaxRetries
 =============================================================================
