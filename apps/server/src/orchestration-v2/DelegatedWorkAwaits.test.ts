@@ -42,6 +42,7 @@ it.effect("a goal waits only for delegated tasks that will wake its thread", () 
       label: string;
       task: OrchestrationV2Subagent;
       expected: boolean;
+      includeClaimedDeliveries?: boolean;
     }> = [
       { label: "running async task", task: base, expected: true },
       {
@@ -63,6 +64,32 @@ it.effect("a goal waits only for delegated tasks that will wake its thread", () 
         expected: true,
       },
       {
+        label: "claimed delivery does not hold a resumed goal",
+        task: {
+          ...base,
+          status: "completed",
+          completionDelivery: { state: "claimed", observedByRunId: null },
+        },
+        includeClaimedDeliveries: false,
+        expected: false,
+      },
+      {
+        label: "running task still holds a goal during a claimed delivery",
+        task: { ...base, completionDelivery: { state: "claimed", observedByRunId: null } },
+        includeClaimedDeliveries: false,
+        expected: true,
+      },
+      {
+        label: "pending delivery still holds a resumed goal",
+        task: {
+          ...base,
+          status: "completed",
+          completionDelivery: { state: "pending", observedByRunId: null },
+        },
+        includeClaimedDeliveries: false,
+        expected: true,
+      },
+      {
         label: "terminal delivered",
         task: {
           ...base,
@@ -78,10 +105,11 @@ it.effect("a goal waits only for delegated tasks that will wake its thread", () 
       },
       { label: "native child", task: { ...base, origin: "provider_native" }, expected: false },
     ];
-    for (const { label, task, expected } of cases) {
+    for (const { label, task, expected, includeClaimedDeliveries = true } of cases) {
       const result = yield* Effect.gen(function* () {
         return yield* (yield* DelegatedWorkAwaits.DelegatedWorkAwaits).awaitsDelegatedWork(
           threadId,
+          { includeClaimedDeliveries },
         );
       }).pipe(
         Effect.provide(

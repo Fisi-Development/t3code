@@ -506,6 +506,60 @@ it.effect.each([
     }).pipe(Effect.provide(layerTest)),
 );
 
+it.effect("a Stop ends the hold so a later message does not resume the goal", () =>
+  Effect.gen(function* () {
+    const orchestrator = yield* Orchestrator.OrchestratorV2;
+    const projections = yield* ProjectionStore.ProjectionStoreV2;
+    const parentThreadId = ThreadId.make("thread:held-goal-stop");
+    yield* createWatchingThread(parentThreadId, 1);
+    yield* send(parentThreadId, "parent", "start_immediately");
+    yield* delegate(parentThreadId, "awaited task");
+    const parent = yield* orchestrator.getThreadProjection(parentThreadId);
+    const now = yield* DateTime.now;
+    const run = parent.runs[0]!;
+    yield* projections.apply({
+      id: EventId.make("event:held-goal:run-completed"),
+      type: "run.updated",
+      threadId: parentThreadId,
+      occurredAt: now,
+      payload: { ...run, status: "completed", completedAt: now },
+    });
+    const providerThread = parent.providerThreads[0]!;
+    yield* projections.apply({
+      id: EventId.make("event:held-goal:paused"),
+      type: "provider-thread.updated",
+      threadId: parentThreadId,
+      occurredAt: now,
+      payload: {
+        ...providerThread,
+        goal: {
+          objective: "Wait for the task",
+          status: "paused",
+          heldForDelegatedWork: true,
+        },
+      },
+    });
+    yield* orchestrator.dispatch({
+      type: "thread.stop",
+      commandId: CommandId.make("stop:held-goal"),
+      threadId: parentThreadId,
+    });
+    const stopEvents = yield* (yield* EventStore.EventStoreV2)
+      .readByCommandId({
+        commandId: CommandId.make("stop:held-goal"),
+      })
+      .pipe(Stream.runCollect);
+    assert.isTrue(
+      stopEvents.some(({ event }) => event.type === "provider-thread.updated"),
+      "Stop publishes the cleared goal before another message can start",
+    );
+    yield* send(parentThreadId, "unrelated message", "start_immediately");
+    const stopped = yield* orchestrator.getThreadProjection(parentThreadId);
+    assert.notProperty(stopped.providerThreads[0]!.goal, "heldForDelegatedWork");
+    assert.equal(stopped.providerThreads[0]!.goal?.status, "paused");
+  }).pipe(Effect.provide(layerTest)),
+);
+
 it.effect("Stop still stops the thread when a delegated child cannot be read", () =>
   Effect.gen(function* () {
     const orchestrator = yield* Orchestrator.OrchestratorV2;

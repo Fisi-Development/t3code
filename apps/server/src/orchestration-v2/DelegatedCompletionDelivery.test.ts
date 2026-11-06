@@ -1975,11 +1975,17 @@ it.layer(Layer.merge(layerTest, ProviderContinuationRequests.layer))(
         parentSend: false,
       },
       {
+        name: "a repeated follow-up still wakes a parent whose goal is held for it",
+        repeat: true,
+        parentSend: false,
+        held: true,
+      },
+      {
         name: "a follow-up the parent asked for still wakes it with the same reply",
         repeat: true,
         parentSend: true,
       },
-    ])("$name", ({ name, repeat, parentSend }) =>
+    ])("$name", ({ name, repeat, parentSend, held }) =>
       Effect.gen(function* () {
         const orchestrator = yield* Orchestrator.OrchestratorV2;
         const eventSink = yield* EventSink.EventSinkV2;
@@ -1998,6 +2004,29 @@ it.layer(Layer.merge(layerTest, ProviderContinuationRequests.layer))(
           deliveryState: "acknowledged",
           now,
         });
+        if (held) {
+          const parent = yield* orchestrator.getThreadProjection(parentThreadId);
+          const providerThread = parent.providerThreads[0]!;
+          yield* eventSink.write({
+            commandId: reconcileCommandId(`${name}:held-goal`),
+            events: [
+              {
+                id: EventId.make(`${name}:event:held-goal`),
+                type: "provider-thread.updated",
+                threadId: parentThreadId,
+                occurredAt: now,
+                payload: {
+                  ...providerThread,
+                  goal: {
+                    objective: "Finish the delegated work",
+                    status: "paused",
+                    heldForDelegatedWork: true,
+                  },
+                },
+              },
+            ],
+          });
+        }
         const child = yield* seedRestartCancelledChild({
           parentThreadId,
           projectId,
@@ -2108,7 +2137,7 @@ it.layer(Layer.merge(layerTest, ProviderContinuationRequests.layer))(
         )!;
         assert.equal(followup.status, "completed");
         assert.equal(followup.result?.trim(), reply.trim());
-        if (repeat && !parentSend) {
+        if (repeat && !parentSend && !held) {
           const reserved = (yield* orchestrator.getThreadProjection(parentThreadId)).runs.find(
             (row) => row.id === parentRunId,
           )?.delegatedCompletion?.delivery;
