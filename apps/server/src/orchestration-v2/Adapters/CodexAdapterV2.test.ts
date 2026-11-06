@@ -8477,7 +8477,7 @@ describe("CodexAdapterV2 post-settle continuation", () => {
 
     const delegatedGoalWait = (
       resume: boolean,
-      mode: "normal" | "running" | "report" | "reopen" | "stopped" = "normal",
+      mode: "normal" | "running" | "report" | "accounting" | "reopen" | "stopped" = "normal",
     ) =>
       Effect.suspend(() => {
         let awaiting = true;
@@ -8512,6 +8512,15 @@ describe("CodexAdapterV2 post-settle continuation", () => {
                   params: { threadId: nativeThreadId, status: "paused" },
                 },
               },
+              ...(mode === "accounting"
+                ? [
+                    notification("goal accounted", "thread/goal/updated", {
+                      threadId: nativeThreadId,
+                      turnId: null,
+                      goal: codexGoal("active", 11),
+                    }),
+                  ]
+                : []),
               ...request(
                 5,
                 "thread/goal/set",
@@ -8608,6 +8617,14 @@ describe("CodexAdapterV2 post-settle continuation", () => {
             [1],
           );
           assert.equal(providerGoals(harness.events).at(-1), "paused");
+          if (mode === "accounting") {
+            const goal = harness.events
+              .flatMap((event) =>
+                event.type === "provider_thread.updated" ? [event.providerThread.goal] : [],
+              )
+              .at(-1);
+            assert.propertyVal(goal, "heldForDelegatedWork", true);
+          }
           if (mode === "report") {
             const firstPause = harness.events.find(
               (event) =>
@@ -8714,6 +8731,9 @@ describe("CodexAdapterV2 post-settle continuation", () => {
     );
     it.effect("the paused goal reports that it is held for delegated work", () =>
       delegatedGoalWait(false, "report"),
+    );
+    it.effect("a goal held for delegated work keeps its hold through Codex goal accounting", () =>
+      delegatedGoalWait(false, "accounting"),
     );
     it.effect("a goal held for delegated work resumes after the session is reopened", () =>
       Effect.gen(function* () {

@@ -1270,7 +1270,7 @@ const seedRestartCancelledChild = (input: {
   readonly name: string;
   readonly completionWake: "always" | "settled_only";
   readonly continuationPending: boolean;
-  readonly runStatus?: "cancelled" | "completed";
+  readonly runStatus?: "cancelled" | "completed" | "running";
   readonly lostWork?: OrchestrationV2Run["restartCancelledBackgroundWork"];
   readonly now: DateTime.Utc;
 }) =>
@@ -1981,11 +1981,18 @@ it.layer(Layer.merge(layerTest, ProviderContinuationRequests.layer))(
         held: true,
       },
       {
+        name: "a repeated follow-up does not wake a held parent that still awaits another task",
+        repeat: true,
+        parentSend: false,
+        held: true,
+        otherTaskRunning: true,
+      },
+      {
         name: "a follow-up the parent asked for still wakes it with the same reply",
         repeat: true,
         parentSend: true,
       },
-    ])("$name", ({ name, repeat, parentSend, held }) =>
+    ])("$name", ({ name, repeat, parentSend, held, otherTaskRunning }) =>
       Effect.gen(function* () {
         const orchestrator = yield* Orchestrator.OrchestratorV2;
         const eventSink = yield* EventSink.EventSinkV2;
@@ -2065,6 +2072,20 @@ it.layer(Layer.merge(layerTest, ProviderContinuationRequests.layer))(
           ],
         });
 
+        if (otherTaskRunning) {
+          yield* seedRestartCancelledChild({
+            parentThreadId,
+            projectId,
+            parentRunId,
+            rootNodeId,
+            name: `${name}:other-child`,
+            completionWake: "always",
+            continuationPending: false,
+            runStatus: "running",
+            now,
+          });
+        }
+
         const original = (yield* orchestrator.getThreadProjection(parentThreadId)).subagents.find(
           (task) => task.id === child.taskId,
         )!;
@@ -2137,7 +2158,7 @@ it.layer(Layer.merge(layerTest, ProviderContinuationRequests.layer))(
         )!;
         assert.equal(followup.status, "completed");
         assert.equal(followup.result?.trim(), reply.trim());
-        if (repeat && !parentSend && !held) {
+        if (repeat && !parentSend && (!held || otherTaskRunning)) {
           const reserved = (yield* orchestrator.getThreadProjection(parentThreadId)).runs.find(
             (row) => row.id === parentRunId,
           )?.delegatedCompletion?.delivery;
