@@ -1,3 +1,4 @@
+import * as DelegatedWorkAwaits from "./DelegatedWorkAwaits.ts";
 import * as WorktreeBranchSync from "./WorktreeBranchSync.ts";
 import * as GuestShareService from "../guest/GuestShareService.ts";
 import * as UsageLimitRecoveryWorker from "./UsageLimitRecoveryWorker.ts";
@@ -366,7 +367,7 @@ export const layer = Layer.mergeAll(
   layerProviderRuntimeRecoveryProvided,
   layerProjectionMaintenanceProvided,
   layerLegacyV1ThreadImporterProvided,
-);
+).pipe(Layer.provideMerge(DelegatedWorkAwaits.layer.pipe(Layer.provide(ProjectionStore.layer))));
 
 export const layerProduction = Layer.mergeAll(
   WorktreeBranchSync.layer.pipe(

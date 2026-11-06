@@ -1,6 +1,7 @@
 import { assert, it } from "@effect/vitest";
 import {
   NodeId,
+  ProviderDriverKind,
   ProviderInstanceId,
   ThreadId,
   type OrchestrationV2Subagent,
@@ -23,7 +24,7 @@ it.effect("D7_waits_only_for_delegated_tasks_that_will_wake_the_parent", () =>
       parentNodeId: NodeId.make("root"),
       origin: "app_owned",
       createdBy: "agent",
-      driver: "codex",
+      driver: ProviderDriverKind.make("codex"),
       providerInstanceId: ProviderInstanceId.make("codex"),
       providerThreadId: null,
       childThreadId: ThreadId.make("child"),
@@ -89,7 +90,7 @@ it.effect("D7_waits_only_for_delegated_tasks_that_will_wake_the_parent", () =>
               Layer.mock(ProjectionStore.ProjectionStoreV2)({
                 getThreadRecords: (requestedThreadId, fields) => {
                   assert.equal(requestedThreadId, threadId);
-                  assert.deepEqual(fields, ["subagents"]);
+                  assert.deepEqual<ReadonlyArray<string>>(fields, ["subagents"]);
                   return Effect.succeed({ subagents: [task] } as never);
                 },
               }),

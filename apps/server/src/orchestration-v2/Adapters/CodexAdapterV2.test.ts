@@ -8597,16 +8597,15 @@ describe("CodexAdapterV2 post-settle continuation", () => {
         if (resume) {
           const beforeWake = requests.length;
           yield* harness.runtime.startTurn(yield* goalTurnInput(harness, "Delegate finished"));
+          const wakeRequests = requests
+            .slice(beforeWake)
+            .filter(({ method }) => method === "turn/start" || method === "thread/goal/set");
           assert.deepEqual(
-            requests
-              .slice(beforeWake)
-              .filter(({ method }) => method === "turn/start" || method === "thread/goal/set"),
-            [
-              { method: "turn/start", params: requests[beforeWake]?.params },
-              { method: "thread/goal/set", params: { threadId: nativeThreadId, status: "active" } },
-            ],
+            wakeRequests.map(({ method }) => method),
+            ["turn/start", "thread/goal/set"],
           );
-          assert.equal(providerGoals(harness.events).at(-1), "active");
+          assert.deepEqual(wakeRequests[1]?.params, { threadId: nativeThreadId, status: "active" });
+          yield* harness.until(() => providerGoals(harness.events).at(-1) === "active");
         }
       }).pipe(
         Effect.scoped,
