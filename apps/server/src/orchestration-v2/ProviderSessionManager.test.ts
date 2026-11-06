@@ -4416,18 +4416,18 @@ it.effect("ProviderSessionManagerV2 gives a delegated child its project's device
 );
 
 it.effect.each([
-  ["R5 idle release of a session past its pin delivers one notice", "idle", true, true],
+  ["idle release of a session past its pin delivers one notice", "idle", true, true],
   [
-    "R5 provider process exit delivers one notice to a thread waiting on background work",
+    "provider process exit delivers one notice to a thread waiting on background work",
     "crash",
     true,
     true,
   ],
-  ["R5 a retried release record delivers one notice", "retry", true, true],
-  ["R5 unawaited background work is released quietly (control)", "idle", false, false],
+  ["a retried release record delivers one notice", "retry", true, true],
+  ["unawaited background work is released quietly", "idle", false, false],
   // The failed turn is the outcome; a notice would start a second run after it.
   [
-    "R5 a process exit during a running turn leaves the failed turn as the only outcome",
+    "a process exit during a running turn leaves the failed turn as the only outcome",
     "busy-crash",
     true,
     false,

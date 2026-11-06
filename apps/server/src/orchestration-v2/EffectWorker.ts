@@ -29,6 +29,7 @@ import * as ThreadManagementService from "./ThreadManagementService.ts";
 import * as ServerSettings from "../serverSettings.ts";
 import { continueRestartedRun } from "./RestartContinuation.ts";
 import { deliverReleasedBackgroundWork } from "./ReleasedBackgroundWork.ts";
+import { removeReleasedBackgroundTasks } from "./ReleasedBackgroundRoster.ts";
 import * as ProjectionStore from "./ProjectionStore.ts";
 import * as EventSink from "./EventSink.ts";
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
@@ -108,12 +109,32 @@ export const layerExecutor: Layer.Layer<
       execute: Effect.fn("OrchestrationEffectExecutorV2.execute")(function (effect, options) {
         const willRetry = options?.willRetry ?? false;
         switch (effect.request.type) {
-          case "background-work.released":
+          case "background-work.released": {
+            const request = effect.request;
             return deliverReleasedBackgroundWork({
               threadId: effect.threadId,
               effectId: effect.id,
-              request: effect.request,
+              request,
             }).pipe(
+              // A notice that cannot be sent must not leave the dead tasks holding the thread.
+              Effect.tapError(() =>
+                willRetry
+                  ? Effect.void
+                  : removeReleasedBackgroundTasks({
+                      threadId: effect.threadId,
+                      providerSessionId: request.providerSessionId,
+                      providerThreadId: request.providerThreadId,
+                      taskIds: request.taskIds,
+                      onlyForReleasedSession: true,
+                    }).pipe(
+                      Effect.catchCause((cause) =>
+                        Effect.logWarning(
+                          "orchestration-v2.background-work-released.roster-removal-failed",
+                          { effectId: effect.id, cause },
+                        ),
+                      ),
+                    ),
+              ),
               Effect.provideService(ThreadManagementService.ThreadManagementService, threads),
               Effect.provideService(ProjectionStore.ProjectionStoreV2, projectionStore),
               Effect.provideService(EventSink.EventSinkV2, eventSink),
@@ -127,6 +148,7 @@ export const layerExecutor: Layer.Layer<
                   }),
               ),
             );
+          }
           case "provider-runtime.continue": {
             const sourceRunId = effect.request.sourceRunId;
             return continueRestartedRun({ threadId: effect.threadId, sourceRunId }).pipe(

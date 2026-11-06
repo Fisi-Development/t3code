@@ -1830,7 +1830,7 @@ const waitingBackgroundFixture = Effect.fn("test.waitingBackgroundFixture")(func
 });
 
 it.effect.each(["awaited", "dev-server control", "empty-roster control"])(
-  "R1 settle refuses a thread waiting on an awaited background command (%s)",
+  "settle refuses a thread waiting on awaited background work (%s)",
   (row) =>
     Effect.gen(function* () {
       const orchestrator = yield* Orchestrator.OrchestratorV2;
@@ -1873,7 +1873,7 @@ it.effect.each(["awaited", "dev-server control", "empty-roster control"])(
     }).pipe(Effect.provide(layerTest)),
 );
 
-it.effect("R1 settle succeeds after Stop clears the wait (control)", () =>
+it.effect("settle succeeds after Stop clears the wait", () =>
   Effect.gen(function* () {
     const orchestrator = yield* Orchestrator.OrchestratorV2;
     const { threadId } = yield* waitingBackgroundFixture("stop-control", true);
@@ -1902,7 +1902,7 @@ it.effect("R1 settle succeeds after Stop clears the wait (control)", () =>
 );
 
 it.effect.each(["cleared", "replacement"] as const)(
-  "R5 a roster another writer already cleared gets no notice (%s control)",
+  "a released-work notice delivers nothing once another writer changed the roster (%s)",
   (row) =>
     Effect.gen(function* () {
       const orchestrator = yield* Orchestrator.OrchestratorV2;

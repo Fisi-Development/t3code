@@ -87,6 +87,8 @@ function layerExecutorFor(input: {
   readonly interrupt?: ProviderTurnControlService.ProviderTurnControlServiceV2Shape["interrupt"];
   readonly rollback?: CheckpointRollbackService.CheckpointRollbackServiceV2Shape["execute"];
   readonly respond?: RuntimeRequestService.RuntimeRequestServiceV2["Service"]["respond"];
+  readonly projectionStore?: Partial<ProjectionStore.ProjectionStoreV2["Service"]>;
+  readonly eventSink?: Partial<EventSink.EventSinkV2["Service"]>;
 }) {
   const record = (event: string) => Ref.update(input.events, (events) => [...events, event]);
   const layerDependencies = Layer.mergeAll(
@@ -163,8 +165,8 @@ function layerExecutorFor(input: {
     Layer.provide(
       Layer.mergeAll(
         layerDependencies,
-        Layer.mock(ProjectionStore.ProjectionStoreV2)({}),
-        Layer.mock(EventSink.EventSinkV2)({}),
+        Layer.mock(ProjectionStore.ProjectionStoreV2)(input.projectionStore ?? {}),
+        Layer.mock(EventSink.EventSinkV2)(input.eventSink ?? {}),
         IdAllocator.layer,
         Layer.mock(ThreadManagementService.ThreadManagementService)(input.threads ?? {}),
         ServerSettings.layerTest(
@@ -569,6 +571,80 @@ it.effect("settles a delegated child once its restart continuation fails for goo
         Exit.isFailure(yield* Effect.exit(executor.execute(effect, { willRetry: false }))),
       );
       assert.deepEqual(yield* Ref.get(recovered), [threadId]);
+    }).pipe(Effect.provide(layer));
+  }),
+);
+
+it.effect("releases dead background tasks once their notice fails for good", () =>
+  Effect.gen(function* () {
+    const timestamp = DateTime.formatIso(yield* DateTime.now);
+    const events = yield* Ref.make<ReadonlyArray<string>>([]);
+    const rosterWrites = yield* Ref.make<ReadonlyArray<ReadonlyArray<string>>>([]);
+    const providerThread = {
+      id: providerThreadId,
+      providerSessionId: oldSessionId,
+      driver: "claudeAgent",
+      providerInstanceId: "claudeAgent",
+      pendingBackgroundTasks: [{ taskId: "b78m03be3", kind: "command", awaited: true }],
+    };
+    const layer = layerExecutorFor({
+      events,
+      threads: {
+        getThreadRecords: () =>
+          Effect.succeed({
+            thread: { archivedAt: null, deletedAt: null, settledOverride: null },
+            providerThreads: [providerThread],
+            runs: [],
+            messages: [],
+          } as never),
+        dispatch: () => Effect.fail(new Error("database is locked") as never),
+      },
+      projectionStore: {
+        getThreadRecords: () => Effect.succeed({ providerThreads: [providerThread] } as never),
+      },
+      eventSink: {
+        writeIfProviderThreadUnchanged: (input) =>
+          Ref.update(rosterWrites, (writes) => [
+            ...writes,
+            input.events.flatMap((event) =>
+              event.type === "provider-thread.updated"
+                ? (event.payload.pendingBackgroundTasks ?? []).map((task) => task.taskId)
+                : [],
+            ),
+          ]).pipe(Effect.as({ committed: true, storedEvents: [] })),
+      },
+    });
+    const effect: EffectOutbox.OrchestrationEffectV2 = {
+      id: `effect:background-work-released:${oldSessionId}:${providerThreadId}:0`,
+      commandId: CommandId.make("command:background-work-released"),
+      threadId,
+      request: {
+        type: "background-work.released",
+        providerThreadId,
+        providerSessionId: oldSessionId,
+        reason: "idle_timeout",
+        taskIds: ["b78m03be3"],
+      },
+      status: "running",
+      attemptCount: 1,
+      availableAt: timestamp,
+      leaseOwner: "test-worker",
+      createdAt: timestamp,
+      updatedAt: timestamp,
+      completedAt: null,
+      lastError: null,
+    };
+    yield* Effect.gen(function* () {
+      const executor = yield* EffectWorker.OrchestrationEffectExecutorV2;
+      assert.isTrue(
+        Exit.isFailure(yield* Effect.exit(executor.execute(effect, { willRetry: true }))),
+      );
+      // A retry may still send the notice, so the tasks stay until the last attempt.
+      assert.deepEqual(yield* Ref.get(rosterWrites), []);
+      assert.isTrue(
+        Exit.isFailure(yield* Effect.exit(executor.execute(effect, { willRetry: false }))),
+      );
+      assert.deepEqual(yield* Ref.get(rosterWrites), [[]]);
     }).pipe(Effect.provide(layer));
   }),
 );
