@@ -13012,8 +13012,19 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
             compareTaskStart(candidate, task) < 0,
         )
         .toSorted((a, b) => compareTaskStart(b, a))[0];
+      const repeatReleasesGoalHold =
+        parentProjection.providerThreads.some((thread) => thread.goal?.heldForDelegatedWork) &&
+        !parentProjection.subagents.some(
+          (candidate) =>
+            candidate.id !== task.id &&
+            candidate.origin === "app_owned" &&
+            candidate.completionWake !== "settled_only" &&
+            (isOrchestrationV2WorkActive(candidate.status) ||
+              candidate.completionDelivery?.state === "pending" ||
+              candidate.completionDelivery?.state === "claimed"),
+        );
       const repeatsNotificationResult =
-        !parentProjection.providerThreads.some((thread) => thread.goal?.heldForDelegatedWork) &&
+        !repeatReleasesGoalHold &&
         task.id !== forkedFrom.nodeId &&
         childControls.messages.some(
           (message) => message.id === childRun.userMessageId && message.notification !== undefined,

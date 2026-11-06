@@ -2002,6 +2002,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
         const goalActivations = new Map<string, { stopped: boolean }>();
         // Held runs must not complete while Stop resolves its target.
         const goalStops = new Map<string, number>();
+        const delegatedGoalPauses = new Set<string>();
         const latestRunTurnId = (providerTurnId: ProviderTurnId) =>
           continuedRuns.get(providerTurnId)?.at(-1)?.providerTurnId ?? providerTurnId;
         const isContinuedRunDescendant = (
@@ -2077,7 +2078,8 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
               ? null
               : {
                   ...goal,
-                  ...(goal.status === "paused" &&
+                  ...((goal.status === "paused" ||
+                    (goal.status === "active" && delegatedGoalPauses.has(nativeThreadId))) &&
                   goalsByNativeThread.get(nativeThreadId)?.heldForDelegatedWork
                     ? { heldForDelegatedWork: true as const }
                     : {}),
@@ -6048,6 +6050,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
           // Keeps a turn Codex starts before settlement an orphan once the goal reads paused.
           goalStops.set(nativeThreadId, (goalStops.get(nativeThreadId) ?? 0) + 1);
           if (forDelegatedWork) {
+            delegatedGoalPauses.add(nativeThreadId);
             const activation = goalActivations.get(nativeThreadId);
             if (activation !== undefined) activation.stopped = true;
             const goal = goalsByNativeThread.get(nativeThreadId);
@@ -6072,7 +6075,13 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
               // The hold is already claimed, so an unanswered pause must not keep the run open.
               Effect.timeout("10 seconds"),
               Effect.flatMap(({ goal }) => {
-                rememberCodexGoal(nativeThreadId, providerGoalFromCodex(goal));
+                const rememberedGoal = providerGoalFromCodex(goal);
+                rememberCodexGoal(
+                  nativeThreadId,
+                  forDelegatedWork && rememberedGoal?.status === "paused"
+                    ? { ...rememberedGoal, heldForDelegatedWork: true }
+                    : rememberedGoal,
+                );
                 return emitGoalUpdate(nativeThreadId);
               }),
               Effect.catch((cause) =>
@@ -6083,6 +6092,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
               ),
               Effect.ensuring(
                 Effect.sync(() => {
+                  if (forDelegatedWork) delegatedGoalPauses.delete(nativeThreadId);
                   const stops = (goalStops.get(nativeThreadId) ?? 1) - 1;
                   if (stops > 0) goalStops.set(nativeThreadId, stops);
                   else goalStops.delete(nativeThreadId);
