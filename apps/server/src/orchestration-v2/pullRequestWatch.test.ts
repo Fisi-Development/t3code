@@ -284,7 +284,7 @@ describe("evaluatePullRequestWatch", () => {
     ]);
   });
 
-  it("wakes once per edit of a remark seen at the watermark, never for the agent's own", () => {
+  it("wakes once per head for edits of a remark seen at the watermark, never for the agent's own", () => {
     const seen = remark("ci-bot", "2026-10-10T19:52:40.000Z");
     const watching = watch({
       headSha: "aaaaaaaaaa",
@@ -300,8 +300,11 @@ describe("evaluatePullRequestWatch", () => {
     assert.deepEqual(evaluatePullRequestWatch(first.next, detail(), [edited]).changes, []);
     const again = { ...seen, editedAt: "2026-10-10T20:05:50.000Z" };
     const second = evaluatePullRequestWatch(first.next, detail(), [again]);
-    assert.deepEqual(second.changes, [{ kind: "remarks", remarks: [again] }]);
-    assert.deepEqual(evaluatePullRequestWatch(second.next, detail(), [again]).changes, []);
+    assert.deepEqual(second.changes, []);
+    assert.deepEqual(
+      evaluatePullRequestWatch(first.next, detail({ headSha: "bbbbbbbbbb" }), [again]).changes,
+      [{ kind: "remarks", remarks: [again] }],
+    );
     const own = { ...edited, author: { login: "agent-user", name: null, avatarUrl: null } };
     assert.deepEqual(evaluatePullRequestWatch(watching, detail(), [own]).changes, []);
   });

@@ -31,6 +31,19 @@ export interface PullRequestWatchReport {
 const isFailedCheck = (check: PullRequestCheck) =>
   check.status === "failure" || check.status === "cancelled" || check.status === "action-required";
 
+export function isProgressAcknowledgement(remark: PullRequestComment): boolean {
+  // CodeRabbit's progress reply to a review command; its later edit carries the outcome and is news.
+  const visible = remark.body
+    .replaceAll(/<!--[\s\S]*?-->/g, "")
+    .replaceAll(/<[^>]+>/g, "")
+    .replaceAll(/\s+/g, " ")
+    .trim();
+  return (
+    remark.body.includes("auto-generated reply by CodeRabbit") &&
+    /^(?:\W+\s*)?Actions? performed (?:Full review|Review) triggered\./i.test(visible)
+  );
+}
+
 export function evaluatePullRequestWatch(
   watch: ThreadPullRequestWatch,
   detail: Pick<
@@ -50,31 +63,45 @@ export function evaluatePullRequestWatch(
   let passed = headMoved ? false : watch.passed;
   let passedChecks = headMoved ? [] : watch.passedChecks;
   let owedChecks = headMoved ? [] : (watch.owedChecks ?? []);
+  let failedRuns = headMoved ? [] : (watch.failedRuns ?? []);
+  const toldRuns = headMoved ? null : (watch.failedRuns ?? null);
   if (detail.checks.length > 0) {
     const failed = detail.checks.filter(isFailedCheck);
-    const newlyFailed = failed.filter((check) => !failedChecks.includes(check.name));
+    const newlyFailed = failed.filter(
+      (check) =>
+        !failedChecks.includes(check.name) ||
+        toldRuns?.some(
+          (run) =>
+            run.name === check.name &&
+            run.url !== null &&
+            check.url !== null &&
+            run.url !== check.url,
+        ),
+    );
     if (newlyFailed.length > 0) changes.push({ kind: "checks-failed", failed: newlyFailed });
     failedChecks = failed.map((check) => check.name);
+    failedRuns = failed.map(({ name, url }) => ({ name, url }));
 
     const required = detail.checks.filter((check) => check.required === true);
     const gate = required.length > 0 ? required : detail.checks;
     const passedNow = gate.every((check) => check.status !== "pending" && !isFailedCheck(check));
     const gateNames = gate.map((check) => check.name);
-    const told = passed && passedChecks.length === 0 ? gateNames : passedChecks;
+    const gateFailed = newlyFailed.some((check) => gateNames.includes(check.name));
+    const toldBefore = passed && passedChecks.length === 0 ? gateNames : passedChecks;
+    const told = gateFailed ? [] : toldBefore;
     // Required checks can finish between sweeps; detect new names. With no required checks, ignore advisory gate growth.
     const gateGrew = required.length > 0 && gateNames.some((name) => !told.includes(name));
     // Other checks still pending when required ones passed are owed one wake when all settle.
     // Only those are owed, so later advisory churn never wakes. One turned required is gate news.
-    const owed =
-      passedNow && passed
-        ? detail.checks
-            .filter((check) => check.required !== true && owedChecks.includes(check.name))
-            .map((check) => check.name)
-        : [];
+    const owed = passedNow
+      ? detail.checks
+          .filter((check) => check.required !== true && owedChecks.includes(check.name))
+          .map((check) => check.name)
+      : owedChecks;
     const settled =
       failed.length === 0 && detail.checks.every((check) => check.status !== "pending");
     owedChecks = owed;
-    if (passedNow && (!passed || gateGrew)) {
+    if (passedNow && (told.length === 0 || gateGrew)) {
       changes.push({ kind: "checks-passed", count: gate.length, required: required.length > 0 });
       owedChecks =
         required.length > 0
@@ -87,7 +114,7 @@ export function evaluatePullRequestWatch(
       owedChecks = [];
     }
     passed = passedNow;
-    passedChecks = passedNow ? gateNames : [];
+    passedChecks = passedNow ? gateNames : told;
   }
 
   // Only a head never read with checks waits for them: an empty read after checks were seen is
@@ -118,7 +145,18 @@ export function evaluatePullRequestWatch(
       remark.author?.login.toLowerCase() !== own
     );
   });
-  if (fresh.length > 0) changes.push({ kind: "remarks", remarks: fresh });
+  const isEdit = (remark: PullRequestComment) =>
+    remark.editedAt != null &&
+    (Date.parse(remark.createdAt) < through ||
+      (Date.parse(remark.createdAt) === through && watch.remarkIds.includes(remark.id)));
+  const told = headMoved ? [] : (watch.remarkEditsTold ?? []);
+  const news = fresh.filter(
+    (remark) => !isProgressAcknowledgement(remark) && !(isEdit(remark) && told.includes(remark.id)),
+  );
+  if (news.length > 0) changes.push({ kind: "remarks", remarks: news });
+  const remarkEditsTold = [
+    ...new Set([...told, ...news.filter(isEdit).map((remark) => remark.id)]),
+  ];
   const latest = Math.max(through, ...fresh.map((remark) => Date.parse(activeAt(remark))));
   const atLatest = fresh.filter((remark) => Date.parse(activeAt(remark)) === latest);
   const remarksThrough = latest === through ? watch.remarksThrough : activeAt(atLatest[0]!);
@@ -145,11 +183,13 @@ export function evaluatePullRequestWatch(
       startedAt: watch.startedAt,
       headSha,
       failedChecks,
+      failedRuns,
       passed,
       passedChecks,
       owedChecks,
       remarksThrough,
       remarkIds,
+      remarkEditsTold,
       conflicting,
       wakes,
       checksAwaitedSince,

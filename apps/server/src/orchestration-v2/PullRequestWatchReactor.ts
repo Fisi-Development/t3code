@@ -175,11 +175,17 @@ function watchesEqual(left: ThreadPullRequestWatch, right: ThreadPullRequestWatc
     left.startedAt === right.startedAt &&
     left.headSha === right.headSha &&
     left.failedChecks.join("\n") === right.failedChecks.join("\n") &&
+    (left.failedRuns ?? []).length === (right.failedRuns ?? []).length &&
+    (left.failedRuns ?? []).every(
+      (run, index) =>
+        run.name === right.failedRuns?.[index]?.name && run.url === right.failedRuns?.[index]?.url,
+    ) &&
     left.passed === right.passed &&
     left.passedChecks.join("\n") === right.passedChecks.join("\n") &&
     (left.owedChecks ?? []).join("\n") === (right.owedChecks ?? []).join("\n") &&
     left.remarksThrough === right.remarksThrough &&
     left.remarkIds.join("\n") === right.remarkIds.join("\n") &&
+    (left.remarkEditsTold ?? []).join("\n") === (right.remarkEditsTold ?? []).join("\n") &&
     left.conflicting === right.conflicting &&
     left.wakes === right.wakes &&
     left.checksAwaitedSince === right.checksAwaitedSince
