@@ -13,6 +13,7 @@ export const PULL_REQUEST_WATCH_WAKE_LIMIT = 10;
 export const PULL_REQUEST_WATCH_NO_CHECKS_MS = 15 * 60_000;
 const LISTED_ITEMS = 10;
 const SNIPPET_LENGTH = 200;
+const ACKNOWLEDGEMENT_PREFIX_LENGTH = 1_000;
 
 export type PullRequestWatchChange =
   | { readonly kind: "checks-failed"; readonly failed: ReadonlyArray<PullRequestCheck> }
@@ -33,15 +34,15 @@ const isFailedCheck = (check: PullRequestCheck) =>
 
 export function isProgressAcknowledgement(remark: PullRequestComment): boolean {
   // CodeRabbit's progress reply to a review command; its later edit carries the outcome and is news.
+  if (!remark.body.includes("auto-generated reply by CodeRabbit")) return false;
+  // The reply opens with its status, so only the start is read; this bounds the stripping below.
   const visible = remark.body
+    .slice(0, ACKNOWLEDGEMENT_PREFIX_LENGTH)
     .replaceAll(/<!--[\s\S]*?-->/g, "")
     .replaceAll(/<[^>]+>/g, "")
     .replaceAll(/\s+/g, " ")
     .trim();
-  return (
-    remark.body.includes("auto-generated reply by CodeRabbit") &&
-    /^(?:\W+\s*)?Actions? performed (?:Full review|Review) triggered\./i.test(visible)
-  );
+  return /^(?:\W+\s*)?Actions? performed (?:Full review|Review) triggered\./i.test(visible);
 }
 
 export function evaluatePullRequestWatch(
