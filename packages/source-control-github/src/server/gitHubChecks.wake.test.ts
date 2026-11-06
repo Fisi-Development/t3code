@@ -152,6 +152,33 @@ describe("GitHub workflow event rollup", () => {
     ]);
   });
 
+  it("when both events' runs failed, the check shows the run that failed last", () => {
+    const failed = (event: string, completedAt: string, job: string) =>
+      run(event, "FAILURE", {
+        completedAt,
+        detailsUrl: `https://github.com/pingdotgg/t3code/actions/runs/1/job/${job}`,
+      });
+    const urls = (rollup: ReadonlyArray<Record<string, unknown>>) =>
+      detailOf(rollup).checks.map(({ name, status, url }) => [name, status, url]);
+    const push = failed("push", "2026-10-08T04:18:58Z", "push-1");
+    const pullRequest = failed("pull_request", "2026-10-08T04:30:00Z", "pr-1");
+    // Listing order does not decide which failed run the check points at.
+    for (const rollup of [
+      [push, pullRequest],
+      [pullRequest, push],
+    ]) {
+      expect(urls(rollup)).toEqual([
+        ["check", "failure", "https://github.com/pingdotgg/t3code/actions/runs/1/job/pr-1"],
+      ]);
+    }
+    // The push run is rerun and fails again before the next read: the check now points at it, so
+    // a watch sees a new failing run rather than the failure it already reported.
+    const pushRerun = failed("push", "2026-10-08T05:00:00Z", "push-2");
+    expect(urls([push, pullRequest, pushRerun])).toEqual([
+      ["check", "failure", "https://github.com/pingdotgg/t3code/actions/runs/1/job/push-2"],
+    ]);
+  });
+
   it("reruns within one event keep the newest attempt", () => {
     expect(
       statuses([

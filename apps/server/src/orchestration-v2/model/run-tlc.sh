@@ -47,14 +47,17 @@ echo "after: no violation; $(grep -E 'distinct states found, 0 states left' "$TM
 
 # One check run by two workflow events.
 cp PullRequestCheckRollup.tla "$TMP/"
-for fixed in FALSE TRUE; do
-  for inv in FailureVisible NoPassWhilePending CancelledIsNotFailure; do
-    printf 'CONSTANT Fixed = %s\nSPECIFICATION Spec\nINVARIANT %s\n' "$fixed" "$inv" > "$TMP/rollup.cfg"
+# base: one run per name; events: worse of the events, first event on a tie; latest: on a tie, the
+# later run.
+for mode in "base FALSE FALSE" "events TRUE FALSE" "latest TRUE TRUE"; do
+  set -- $mode
+  for inv in FailureVisible NoPassWhilePending CancelledIsNotFailure ShownFailureIsLatest; do
+    printf 'CONSTANTS\n  Fixed = %s\n  TieLater = %s\nSPECIFICATION Spec\nINVARIANT %s\n' "$2" "$3" "$inv" > "$TMP/rollup.cfg"
     (cd "$TMP" && java -cp "$JAR" tlc2.TLC -workers 1 -deadlock -config rollup.cfg PullRequestCheckRollup.tla) > "$TMP/out.txt" 2>&1
     if grep -q "is violated" "$TMP/out.txt"; then
-      echo "rollup Fixed=$fixed $inv: violated, trace length $(grep -c '^State [0-9]*:' "$TMP/out.txt")"
+      echo "rollup $1 $inv: violated, trace length $(grep -c '^State [0-9]*:' "$TMP/out.txt")"
     else
-      echo "rollup Fixed=$fixed $inv: holds, $(grep -E 'distinct states found, 0 states left' "$TMP/out.txt" | tail -1)"
+      echo "rollup $1 $inv: holds, $(grep -E 'distinct states found, 0 states left' "$TMP/out.txt" | tail -1)"
     fi
   done
 done

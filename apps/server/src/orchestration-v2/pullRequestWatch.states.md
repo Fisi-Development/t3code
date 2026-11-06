@@ -24,33 +24,34 @@ vp test run apps/server/src/orchestration-v2/pullRequestWatch.wake.test.ts packa
 
 ## Events and transitions
 
-| Event                                                             | Remarks                                                                    | Checks            | Conflict                           |
-| ----------------------------------------------------------------- | -------------------------------------------------------------------------- | ----------------- | ---------------------------------- |
-| Read, nothing changed                                             | ignore                                                                     | ignore            | ignore                             |
-| New remark by someone else                                        | wake                                                                       |                   |                                    |
-| Own remark                                                        | ignore                                                                     |                   |                                    |
-| Bot edits a remark, first time on this head                       | wake                                                                       |                   |                                    |
-| Bot edits the same remark again on this head                      | ignore (cursor advances)                                                   |                   |                                    |
-| CodeRabbit "Review triggered." acknowledgement                    | ignore (cursor advances); its later edit wakes once                        |                   |                                    |
-| Check fails (name not failing before)                             |                                                                            | wake              |                                    |
-| Same check fails again after a pending read (retry)               |                                                                            | wake              |                                    |
-| Same check fails again with a new run URL, no pending read seen   |                                                                            | wake              |                                    |
-| Same failing run read again                                       |                                                                            | ignore            |                                    |
-| Gate passes, not told on this head                                |                                                                            | wake              |                                    |
-| Gate passes again after a pending read, already told on this head |                                                                            | ignore            |                                    |
-| Gate passes after a gate failure on this head                     |                                                                            | wake              |                                    |
-| A new required check joins a passing gate                         |                                                                            | wake              |                                    |
-| Advisory check appears or churns with no required checks          |                                                                            | ignore            |                                    |
-| Read failed or returned no checks                                 |                                                                            | keep prior state  |                                    |
-| Host still computing mergeability                                 |                                                                            |                   | keep prior state                   |
-| Branch becomes conflicting, not told on this head                 |                                                                            |                   | wake                               |
-| Push (head moves)                                                 | edits may wake once more                                                   | check news resets | an unresolved conflict wakes again |
-| Comment-only wakes reach the limit                                | stop watching, tell the agent                                              |                   |                                    |
-| PR merged or closed                                               | end the watch, tell the agent when closed                                  |                   |                                    |
-| Stop, settle, archive, subagent thread                            | end the watch, no wake                                                     |                   |                                    |
-| Watch again after a stop                                          | check state resumes from the ended watch; remarks restart at the new start |                   |                                    |
-| Server restart                                                    | all of the above is persisted on the watch                                 |                   |                                    |
-| Rate limited                                                      | skip the read, no state change                                             |                   |                                    |
+| Event                                                              | Remarks                                                                    | Checks                             | Conflict                           |
+| ------------------------------------------------------------------ | -------------------------------------------------------------------------- | ---------------------------------- | ---------------------------------- |
+| Read, nothing changed                                              | ignore                                                                     | ignore                             | ignore                             |
+| New remark by someone else                                         | wake                                                                       |                                    |                                    |
+| Own remark                                                         | ignore                                                                     |                                    |                                    |
+| Bot edits a remark, first time on this head                        | wake                                                                       |                                    |                                    |
+| Bot edits the same remark again on this head                       | ignore (cursor advances)                                                   |                                    |                                    |
+| CodeRabbit "Review triggered." acknowledgement                     | ignore (cursor advances); its later edit wakes once                        |                                    |                                    |
+| Check fails (name not failing before)                              |                                                                            | wake                               |                                    |
+| Same check fails again after a pending read (retry)                |                                                                            | wake                               |                                    |
+| Same check fails again with a new run URL, no pending read seen    |                                                                            | wake                               |                                    |
+| Both events' runs failed; either is rerun and fails again (GitHub) |                                                                            | wake (the row shows the later run) |                                    |
+| Same failing run read again                                        |                                                                            | ignore                             |                                    |
+| Gate passes, not told on this head                                 |                                                                            | wake                               |                                    |
+| Gate passes again after a pending read, already told on this head  |                                                                            | ignore                             |                                    |
+| Gate passes after a gate failure on this head                      |                                                                            | wake                               |                                    |
+| A new required check joins a passing gate                          |                                                                            | wake                               |                                    |
+| Advisory check appears or churns with no required checks           |                                                                            | ignore                             |                                    |
+| Read failed or returned no checks                                  |                                                                            | keep prior state                   |                                    |
+| Host still computing mergeability                                  |                                                                            |                                    | keep prior state                   |
+| Branch becomes conflicting, not told on this head                  |                                                                            |                                    | wake                               |
+| Push (head moves)                                                  | edits may wake once more                                                   | check news resets                  | an unresolved conflict wakes again |
+| Comment-only wakes reach the limit                                 | stop watching, tell the agent                                              |                                    |                                    |
+| PR merged or closed                                                | end the watch, tell the agent when closed                                  |                                    |                                    |
+| Stop, settle, archive, subagent thread                             | end the watch, no wake                                                     |                                    |                                    |
+| Watch again after a stop                                           | check state resumes from the ended watch; remarks restart at the new start |                                    |                                    |
+| Server restart                                                     | all of the above is persisted on the watch                                 |                                    |                                    |
+| Rate limited                                                       | skip the read, no state change                                             |                                    |                                    |
 
 ## Known limits
 

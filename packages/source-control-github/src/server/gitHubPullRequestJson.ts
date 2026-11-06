@@ -657,12 +657,21 @@ const CHECK_RANK: Record<PullRequestCheckStatus, number> = {
   cancelled: 0,
 };
 
+/** Unparseable or missing times never win a tie. */
+function finishedLater(candidate: string | null, kept: string | null): boolean {
+  const candidateAt = candidate === null ? Number.NaN : Date.parse(candidate);
+  const keptAt = kept === null ? Number.NaN : Date.parse(kept);
+  if (Number.isNaN(candidateAt)) return false;
+  return Number.isNaN(keptAt) || candidateAt > keptAt;
+}
+
 function toChecks(
   raw: ReadonlyArray<CheckFields> | null | undefined,
 ): ReadonlyArray<PullRequestCheck> {
   type Entry = ReturnType<typeof toCheckEntries>[number];
   // Runs of one check started by different events (push and pull_request) are independent, so
-  // each event keeps its newest run and the check reports the worse of them.
+  // each event keeps its newest run and the check reports the worse of them. Between equally bad
+  // runs the later one is shown, so a rerun that fails again is the run a watch compares.
   const byRun = new Map<string, Array<Entry>>();
   for (const entry of toCheckEntries(raw)) {
     const key = JSON.stringify([entry.workflowName ?? "", entry.check.name, entry.event ?? ""]);
@@ -672,14 +681,15 @@ function toChecks(
   for (const runs of byRun.values()) {
     const newest = dedupeChecks(runs)[0];
     if (newest === undefined) continue;
-    const entry = { ...runs[0]!, check: newest };
+    const entry = runs.find((run) => run.check === newest) ?? { ...runs[0]!, check: newest };
     const key = JSON.stringify([entry.workflowName ?? "", newest.name]);
     const kept = byCheck.get(key);
     if (kept === undefined) {
       byCheck.set(key, entry);
       continue;
     }
-    const chosen = CHECK_RANK[newest.status] > CHECK_RANK[kept.check.status] ? entry : kept;
+    const rank = CHECK_RANK[newest.status] - CHECK_RANK[kept.check.status];
+    const chosen = rank > 0 || (rank === 0 && finishedLater(entry.at, kept.at)) ? entry : kept;
     byCheck.set(
       key,
       kept.check.required === true || newest.required === true
