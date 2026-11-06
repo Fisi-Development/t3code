@@ -542,13 +542,16 @@ const make = Effect.gen(function* () {
           OrchestratorMcpFailure: Effect.fn("RemoteDelegation.followFailed")(function* (error) {
             const reason = yield* finalReason(parentThreadId, taskId, error);
             if (reason === undefined) return yield* error;
-            const completed = (yield* readTask(parentThreadId, taskId)).task;
-            if (completed?.result != null) {
+            const { task } = yield* readTask(parentThreadId, taskId);
+            // Only a finished task's follow-up watch ends here; a stop still owed is recorded below.
+            if (
+              task?.remoteChild?.stoppedThere === true &&
+              task.remoteChild.followUpsUntil !== undefined
+            ) {
               yield* Effect.logInfo("remote-delegation.follow-up-watch-ended", { taskId, reason });
               return;
             }
             // Gone there, or no link to reach it by: nothing left to stop there.
-            const { task } = yield* readTask(parentThreadId, taskId);
             const stopCount = task?.remoteChild?.stopCount;
             yield* complete(parentThreadId, taskId, "failed", reason, "stopped", stopCount);
           }),

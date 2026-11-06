@@ -1692,6 +1692,8 @@ it.effect("cancel ends the task here even when the link is gone", () =>
       expect(task?.status).toBe("cancelled");
       expect(task?.result).toContain("could not be stopped in Box");
       expect(yield* Ref.get(thread.interrupted)).toBe(0);
+      // The follower records that nothing is left to stop, so no restart owes it again.
+      expect(yield* stoppedThere(a, delegated.taskId, null)).toMatchObject({ status: "cancelled" });
     }),
   ).pipe(Effect.provide(NodeHttpServer.layerTest)),
 );

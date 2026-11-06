@@ -7,7 +7,9 @@ status=0
 for cfg in DelegatedCompletion.*.cfg; do
   name=${cfg#DelegatedCompletion.}; name=${name%.cfg}
   out=$(java -XX:+UseParallelGC -cp "$JAR" tlc2.TLC -workers 2 -deadlock -cleanup -metadir "${TMPDIR:-/tmp}/tlc-$name" -config "$cfg" DelegatedCompletion.tla 2>&1)
-  if printf '%s' "$out" | grep -q -E 'is violated|Temporal properties were violated'; then verdict=violation; else verdict=clean; fi
+  if printf '%s' "$out" | grep -q -E 'is violated|Temporal properties were violated'; then verdict=violation
+  elif printf '%s' "$out" | grep -q 'Model checking completed. No error has been found.'; then verdict=clean
+  else verdict=error; fi
   states=$(printf '%s' "$out" | grep -E 'distinct states found' | tail -1)
   bad=$(printf '%s' "$out" | grep -E 'Invariant .* is violated|Temporal properties were violated' | head -1)
   len=$(printf '%s' "$out" | grep -c -E '^State [0-9]+:')
