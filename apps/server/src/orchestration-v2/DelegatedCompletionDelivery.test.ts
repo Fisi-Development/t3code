@@ -3165,19 +3165,110 @@ it.layer(layerTest)("delegated tasks across a server restart", (it) => {
     }),
   );
 
+  // Running does not prove prompt consumption in Claude; re-offer cut deliveries even when resuming the turn.
+  it.effect("re-offers a cut delivery even when a continuation resumes its turn", () =>
+    Effect.gen(function* () {
+      const orchestrator = yield* Orchestrator.OrchestratorV2;
+      const eventSink = yield* EventSink.EventSinkV2;
+      const now = yield* DateTime.now;
+      const seed = (name: string, continuationPending: boolean) =>
+        Effect.gen(function* () {
+          const threadId = ThreadId.make(`thread:${name}`);
+          const runId = RunId.make(`run:${name}`);
+          const taskId = NodeId.make(`node:${name}-task`);
+          const messageId = MessageId.make(`message:delegated-delivery:${threadId}`);
+          const deliveryRunId = RunId.make(`run:${name}:delivery`);
+          yield* seedParentWithTerminalTask({
+            threadId,
+            projectId: ProjectId.make(`project:${name}`),
+            runId,
+            rootNodeId: NodeId.make(`node:${name}-root`),
+            taskId,
+            deliveryState: "claimed",
+            completionWake: "always",
+            deliveryTaskIds: [taskId],
+            now,
+          });
+          yield* eventSink.writeWithEffects({
+            commandId: reconcileCommandId(name),
+            events: [
+              {
+                id: EventId.make(`event:${name}:delivery-message`),
+                type: "message.updated",
+                threadId,
+                runId: deliveryRunId,
+                occurredAt: now,
+                payload: {
+                  id: messageId,
+                  threadId,
+                  runId: deliveryRunId,
+                  nodeId: null,
+                  role: "user",
+                  text: `Delegated task ${taskId} reached a terminal state.`,
+                  attachments: [],
+                  streaming: false,
+                  createdBy: "agent",
+                  creationSource: "server",
+                  createdAt: now,
+                  updatedAt: now,
+                  delegatedCompletion: { parentRunId: runId, generation: 1, taskIds: [taskId] },
+                },
+              },
+              runEvent({
+                threadId,
+                runId: deliveryRunId,
+                ordinal: 2,
+                status: "cancelled",
+                now,
+                providerThreadId: parentProviderThreadId(threadId),
+                userMessageId: messageId,
+              }),
+            ],
+            effects: continuationPending
+              ? [
+                  {
+                    id: `effect:restart-continuation:${deliveryRunId}`,
+                    commandId: reconcileCommandId(name),
+                    threadId,
+                    request: { type: "provider-runtime.continue", sourceRunId: deliveryRunId },
+                  },
+                ]
+              : [],
+          });
+          return { threadId, runId, taskId };
+        });
+      const cut = yield* seed("delivery-cut", false);
+      const resumed = yield* seed("delivery-resumed", true);
+
+      yield* orchestrator.recoverDelegatedTasks;
+
+      for (const seeded of [cut, resumed]) {
+        const projection = yield* orchestrator.getThreadProjection(seeded.threadId);
+        assert.deepEqual(
+          projection.subagents.find((row) => row.id === seeded.taskId)?.completionDelivery?.state,
+          "claimed",
+        );
+        const delivery = projection.runs.find((row) => row.id === seeded.runId)?.delegatedCompletion
+          ?.delivery;
+        assert.equal(delivery?.generation, 2);
+        assert.deepEqual(delivery?.taskIds, [seeded.taskId]);
+      }
+    }),
+  );
+
   it.effect.each([
     {
-      name: "D8_delivery_run_cancelled_after_it_started_is_not_sent_again",
+      name: "a delivery its run already answered is not sent again when the run is cut",
       started: true,
       restart: false,
     },
     {
-      name: "D8_restart_during_a_started_delivery_does_not_resend_it",
+      name: "a restart that cuts an answered delivery does not send it again",
       started: true,
       restart: true,
     },
     {
-      name: "D2_delivery_run_cancelled_before_it_started_is_redelivered_once",
+      name: "a delivery cut before its run started is sent again once",
       started: false,
       restart: false,
     },
@@ -3221,11 +3312,38 @@ it.layer(layerTest)("delegated tasks across a server restart", (it) => {
       assert.isNull(deliveryRun.startedAt);
       const active = { ...deliveryRun, status: "running" as const, startedAt: now };
       if (started) {
+        // The provider read the delivery: its run wrote reasoning before the cut.
         yield* eventSink.write({
           events: [
             {
               ...runEvent({ threadId, runId: deliveryRun.id, ordinal: 2, status: "running", now }),
               payload: active,
+            },
+            {
+              id: EventId.make(`event:${name}:answer`),
+              type: "turn-item.updated",
+              threadId,
+              runId: deliveryRun.id,
+              occurredAt: now,
+              payload: {
+                id: TurnItemId.make(`turn-item:${name}:answer`),
+                type: "reasoning",
+                threadId,
+                runId: deliveryRun.id,
+                nodeId: deliveryRun.rootNodeId,
+                providerThreadId: null,
+                providerTurnId: null,
+                nativeItemRef: null,
+                parentItemId: null,
+                ordinal: 1,
+                status: "completed",
+                title: "Reasoning",
+                startedAt: now,
+                completedAt: now,
+                updatedAt: now,
+                text: "Reviewing the delegated result.",
+                streaming: false,
+              },
             },
           ],
         });

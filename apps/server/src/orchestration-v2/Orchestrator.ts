@@ -755,6 +755,20 @@ function legacyPullRequestLink(
   );
 }
 
+/** Items only the provider writes while answering a turn: evidence it read the turn's input. */
+const DELIVERY_ANSWER_TURN_ITEM_TYPES = [
+  "assistant_message",
+  "reasoning",
+  "command_execution",
+  "dynamic_tool",
+  "file_change",
+  "file_search",
+  "web_search",
+  "proposed_plan",
+  "todo_list",
+  "subagent",
+] as const satisfies ReadonlyArray<OrchestrationV2TurnItem["type"]>;
+
 const DELEGATED_RESULT_INLINE_BYTES = 16_000;
 
 /** Earlier start first; a task that has not started sorts last. */
@@ -13214,9 +13228,18 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       return;
     }
 
-    // This rule covers dedicated delivery runs; mailbox steers retain acceptance-based recovery.
-    const cancelledBeforeStart =
-      deliveryRun.status === "cancelled" && deliveryRun.startedAt === null;
+    // A running run does not prove the provider read the prompt, so a cut delivery is
+    // re-offered unless its run already answered it. Mailbox steers never reach here:
+    // their run's input is not the delivery message.
+    const cancelledBeforeAnswer =
+      deliveryRun.status === "cancelled" &&
+      (deliveryRun.startedAt === null ||
+        (yield* projectionStore
+          .getThreadRecords(threadId, ["turnItems"], {
+            turnItemRunId: runId,
+            turnItemTypes: DELIVERY_ANSWER_TURN_ITEM_TYPES,
+          })
+          .pipe(Effect.map(({ turnItems }) => turnItems.length === 0))));
     const now = yield* DateTime.now;
     const nextTaskStates = new Map<
       OrchestrationV2Subagent["id"],
@@ -13232,7 +13255,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         continue;
       }
       nextTaskStates.set(task.id, {
-        state: cancelledBeforeStart ? "pending" : "delivered",
+        state: cancelledBeforeAnswer ? "pending" : "delivered",
         observedByRunId: null,
       });
     }
