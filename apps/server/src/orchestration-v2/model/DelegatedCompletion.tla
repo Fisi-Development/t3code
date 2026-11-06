@@ -8,7 +8,7 @@
 (* retries, and a Codex goal that keeps starting turns.                    *)
 (*                                                                         *)
 (* Fixed = FALSE models upstream main before this change; Fixed = TRUE     *)
-(* models it after. Each catalogue row has its own invariant or property.  *)
+(* models it after. Each failure has its own invariant or property.      *)
 (***************************************************************************)
 EXTENDS Naturals, Sequences, FiniteSets
 
@@ -105,7 +105,7 @@ FollowerDies ==
 (* The child wakes on its own background work after its result and replies *)
 (* again, with the same text (sameText) or a revised one. Since upstream    *)
 (* #23542 a local child's wake starts a follow-up task Fn that wakes the   *)
-(* parent; a linked child's reply after its result reaches no one (D5).    *)
+(* parent; a linked child's reply after its result reaches no one.        *)
 ChildWakesItself(sameText) ==
     /\ recorded /\ child = "resulted" /\ wakes < MaxFollowUps
     /\ wakes' = wakes + 1
@@ -178,33 +178,33 @@ Spec ==
            WF_vars(ParentTakes(m))
 
 -----------------------------------------------------------------------------
-(* Invariants, one per catalogue row.                                      *)
+(* Invariants and properties, one per failure.                            *)
 
-\* D2, D3: one delivery per awaited event at the consumer. A re-armed
+\* One delivery per awaited event at the consumer. A re-armed
 \* generation replaces a run the provider never took, so the model sees it once.
-\* D8 (restart case), D9: a run cut after the provider took it must not re-arm.
+\* A run cut after the provider answered it (a restart) must not re-arm.
 OneWakePerEvent ==
     \A i, j \in 1..Len(consumed) :
         i # j => ~(consumed[i].task = consumed[j].task /\ consumed[i].ver = consumed[j].ver)
 
-\* D4: a wake about this child names the task the parent waits on, or says it
+\* A wake about this child names the task the parent waits on, or says it
 \* is a follow-up of it. An unlabelled follow-up reads as the same completion twice.
 WakeNamesAwaitedTask ==
     \A i \in 1..Len(consumed) : consumed[i].task = "T0" \/ consumed[i].of = "T0"
 
-\* D4, D8: no wake without news. A follow-up whose reply repeats the last
+\* No wake without news. A follow-up whose reply repeats the last
 \* result the parent was sent does not wake it.
 NoWakeWithoutNews ==
     \A i, j \in 1..Len(consumed) :
         i < j => consumed[i].ver # consumed[j].ver
 
-\* D7: no parent turn while it waits on T0 and nothing new arrived.
+\* No parent turn while it waits on T0 and nothing new arrived.
 NoGoalSpin == spins = 0
 
-\* D5, D6: every wait reaches exactly one delivered terminal outcome.
+\* Every wait reaches exactly one delivered terminal outcome.
 TerminalDelivered == <>(~Outstanding)
 
-\* D5: the child's latest reply reaches the parent, also when the child
+\* The child's latest reply reaches the parent, also when the child
 \* replies again after its result in a linked environment.
 SeenVersion == IF consumed = <<>> THEN 0
                ELSE LET vs == {consumed[i].ver : i \in 1..Len(consumed)}

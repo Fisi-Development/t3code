@@ -12,6 +12,6 @@ for cfg in DelegatedCompletion.*.cfg; do
   bad=$(printf '%s' "$out" | grep -E 'Invariant .* is violated|Temporal properties were violated' | head -1)
   len=$(printf '%s' "$out" | grep -c -E '^State [0-9]+:')
   echo "$name: $verdict ${bad:+($bad, trace $len states)} $states"
-  case "$name:$verdict" in before-D2D3:clean|before-*:violation|after-*:clean) ;; *) status=1 ;; esac
+  case "$name:$verdict" in before-cut-before-start:clean|before-*:violation|after-*:clean) ;; *) status=1 ;; esac
 done
 exit $status
