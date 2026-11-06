@@ -11,7 +11,10 @@ export const layer = Layer.effect(
     return {
       awaitsDelegatedWork: Effect.fn("DelegatedWorkAwaits.awaitsDelegatedWork")(
         function* (threadId: ThreadId) {
-          const { subagents } = yield* projectionStore.getThreadRecords(threadId, ["subagents"]);
+          // Settled, delivered tasks are left out in SQL, so a thread with thousands of them stays cheap.
+          const { subagents } = yield* projectionStore.getThreadRecords(threadId, ["subagents"], {
+            omitSettledSubagents: true,
+          });
           return subagents.some(
             (task) =>
               task.origin === "app_owned" &&
