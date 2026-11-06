@@ -8,6 +8,7 @@ import {
   MessageId,
   NodeId,
   type OrchestrationV2Run,
+  type OrchestratorMcpThreadWaitInput,
   ProjectId,
   ProviderDriverKind,
   ProviderInstanceId,
@@ -292,7 +293,9 @@ const boxToolkitLayer = (thread: BoxThread) => {
           };
         }
         // Unpinned, a wait reports the latest run: a later one once there is one.
-        const later = input.runId === undefined && (yield* Ref.get(thread.laterReply)) !== null;
+        const later =
+          (input.runId === boxLaterRunId || input.runId === undefined) &&
+          (yield* Ref.get(thread.laterReply)) !== null;
         return {
           threadId: input.threadId,
           run: {
@@ -819,6 +822,139 @@ const taskResult = (laptopEnv: Effect.Success<ReturnType<typeof makeLaptop>>, ta
           : undefined,
       ),
     );
+
+const followUpWaiter =
+  (
+    nextRun: Deferred.Deferred<void>,
+    calls: Ref.Ref<ReadonlyArray<OrchestratorMcpThreadWaitInput>>,
+  ) =>
+  (
+    wait: PeerForwarding.PeerForwarding["Service"]["waitForThread"],
+  ): PeerForwarding.PeerForwarding["Service"]["waitForThread"] =>
+  (scope, environmentId, input) => {
+    const afterRunId = "afterRunId" in input ? input.afterRunId : undefined;
+    if (afterRunId === undefined) return wait(scope, environmentId, input);
+    return Effect.gen(function* () {
+      yield* Ref.update(calls, (seen) => [...seen, input]);
+      const next = yield* (afterRunId === boxRunId ? Deferred.await(nextRun) : Effect.never).pipe(
+        Effect.timeoutOption(input.timeoutMs!),
+      );
+      return {
+        threadId: input.threadId,
+        runId: Option.isSome(next) ? boxLaterRunId : (afterRunId as RunId),
+        status: "completed" as const,
+        timedOut: Option.isNone(next),
+      };
+    });
+  };
+
+it.effect.each([
+  {
+    restart: false,
+    name: "D5_linked_child_reply_after_its_result_wakes_the_parent_as_a_follow_up",
+  },
+  { restart: true, name: "D5_follow_up_watch_survives_a_restart" },
+])("$name", ({ restart }) =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const thread = yield* makeBoxThread;
+      const b = yield* serveBox(thread);
+      const offers = yield* SubscriptionRef.make<
+        ReadonlyArray<ProviderContinuationRequests.ProviderContinuationRequest>
+      >([]);
+      const database = yield* SqlitePersistence.layerMemory.pipe(Layer.build);
+      const linking = yield* layerLinkingEnvironment(laptop).pipe(Layer.build);
+      const nextRun = yield* Deferred.make<void>();
+      const calls = yield* Ref.make<ReadonlyArray<OrchestratorMcpThreadWaitInput>>([]);
+      const follower = yield* Deferred.make<Fiber.Fiber<unknown, unknown>>();
+      const prepare = Effect.gen(function* () {
+        const a = yield* makeLaptop(
+          database,
+          offers,
+          linking,
+          followUpWaiter(nextRun, calls),
+          restart ? undefined : follower,
+        );
+        yield* linkTo(a.links, b, "full-access");
+        yield* seedParent(a);
+        const delegated = yield* delegateToBox(a);
+        yield* Ref.set(thread.reply, "Probes done; suites still running.");
+        yield* Ref.set(thread.status, "completed");
+        yield* Deferred.succeed(thread.finished, undefined);
+        yield* taskResult(a, delegated.taskId);
+        yield* SubscriptionRef.changes(offers).pipe(
+          Stream.filter((seen) => seen.length > 0),
+          Stream.runHead,
+        );
+        // Consume the first wake before the later reply, so it gets its own delivery.
+        yield* a.call("task_status", { taskId: delegated.taskId });
+        return { a, delegated };
+      });
+      const before = yield* restart ? Effect.scoped(prepare) : prepare;
+      const a = restart
+        ? yield* makeLaptop(database, offers, linking, followUpWaiter(nextRun, calls), follower)
+        : before.a;
+      if (restart) {
+        expect(yield* a.projections.getOpenRemoteDelegatedTasks).toEqual([
+          { parentThreadId, taskId: before.delegated.taskId },
+        ]);
+        yield* a.remote.start();
+      }
+      yield* Ref.set(thread.laterReply, "All suites pass. Final verdict: ready.");
+      yield* Deferred.succeed(nextRun, undefined);
+      yield* Fiber.await(yield* Deferred.await(follower));
+      const tasks = (yield* a.orchestrator.getThreadProjection(parentThreadId)).subagents;
+      expect(tasks).toHaveLength(2);
+      const followUp = tasks.find((task) => task.id !== before.delegated.taskId)!;
+      expect(yield* taskResult(a, followUp.id)).toMatchObject({
+        result: "All suites pass. Final verdict: ready.",
+        remoteChild: { runId: boxLaterRunId },
+      });
+      const wakes = yield* SubscriptionRef.changes(offers).pipe(
+        Stream.filter((seen) => seen.length >= 2),
+        Stream.runHead,
+      );
+      expect(Option.getOrThrow(wakes)[1]?.detail).toContain(
+        `a follow-up of task ${before.delegated.taskId}`,
+      );
+    }),
+  ).pipe(Effect.provide(NodeHttpServer.layerTest)),
+);
+
+it.effect("D5_follow_up_watch_ends_after_its_window", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const thread = yield* makeBoxThread;
+      const b = yield* serveBox(thread);
+      const offers = yield* SubscriptionRef.make<
+        ReadonlyArray<ProviderContinuationRequests.ProviderContinuationRequest>
+      >([]);
+      const database = yield* SqlitePersistence.layerMemory.pipe(Layer.build);
+      const follower = yield* Deferred.make<Fiber.Fiber<unknown, unknown>>();
+      const calls = yield* Ref.make<ReadonlyArray<OrchestratorMcpThreadWaitInput>>([]);
+      const nextRun = yield* Deferred.make<void>();
+      const a = yield* makeLaptop(
+        database,
+        offers,
+        undefined,
+        followUpWaiter(nextRun, calls),
+        follower,
+      );
+      yield* linkTo(a.links, b, "full-access");
+      yield* seedParent(a);
+      const delegated = yield* delegateToBox(a);
+      yield* Ref.set(thread.status, "completed");
+      yield* Deferred.succeed(thread.finished, undefined);
+      yield* taskResult(a, delegated.taskId);
+      yield* TestClock.adjust("2 hours");
+      yield* Fiber.await(yield* Deferred.await(follower));
+      expect(yield* Ref.get(calls)).toHaveLength(12);
+      yield* TestClock.adjust("1 hour");
+      expect(yield* Ref.get(calls)).toHaveLength(12);
+      expect((yield* a.orchestrator.getThreadProjection(parentThreadId)).subagents).toHaveLength(1);
+    }),
+  ).pipe(Effect.provide(NodeHttpServer.layerTest)),
+);
 
 it.effect("a task delegated to the box wakes the laptop's parent when it ends there", () =>
   Effect.scoped(

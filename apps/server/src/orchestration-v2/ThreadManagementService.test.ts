@@ -198,6 +198,90 @@ it.effect(
   },
 );
 
+it.effect.each(["next", "timeout", "unknown"] as const)("afterRunId: %s", (scenario) =>
+  Effect.gen(function* () {
+    const projectId = ProjectId.make("project:after-run");
+    const threadId = ThreadId.make("thread:after-run");
+    const firstId = RunId.make("run:first");
+    const nextId = RunId.make("run:next");
+    const subscribed = yield* Deferred.make<void>();
+    const events = yield* Queue.unbounded<OrchestrationV2StoredEvent>();
+    let runs = [
+      { id: firstId, ordinal: 1, status: "completed" },
+    ] as ReadonlyArray<OrchestrationV2Run>;
+    const service = yield* ThreadManagementService.ThreadManagementService.pipe(
+      Effect.provide(
+        ThreadManagementService.layer.pipe(
+          Layer.provide(Layer.mock(ProviderSessionManager.ProviderSessionManagerV2)({})),
+          Layer.provide(
+            Layer.mock(Orchestrator.OrchestratorV2)({
+              getThreadEventSequence: () => Effect.succeed(0),
+              restartContinuationPending: () => Effect.succeed(false),
+              streamStoredEventsFrom: (input) =>
+                input?.eventType === "run.updated"
+                  ? Stream.fromEffect(Deferred.succeed(subscribed, undefined)).pipe(
+                      Stream.drain,
+                      Stream.concat(Stream.fromQueue(events)),
+                    )
+                  : Stream.never,
+              getThreadRecords: () =>
+                Effect.sync(
+                  () =>
+                    ({
+                      thread: { id: threadId, projectId, deletedAt: null },
+                      runs,
+                    }) as unknown as OrchestrationV2ThreadProjection,
+                ),
+            }),
+          ),
+          Layer.provide(ServerSettings.layerTest()),
+          Layer.provide(layerReceiptsTest),
+        ),
+      ),
+    );
+    const input = {
+      projectId,
+      threadId,
+      afterRunId: scenario === "unknown" ? RunId.make("run:missing") : firstId,
+      timeoutMs: 1_000,
+    };
+    if (scenario === "unknown") {
+      const outcome = yield* service.waitForThread(input).pipe(Effect.result);
+      expect(outcome).toMatchObject({
+        _tag: "Failure",
+        failure: { _tag: "ThreadManagementRunNotFoundError", runId: input.afterRunId },
+      });
+      return;
+    }
+    const fiber = yield* service.waitForThread(input).pipe(Effect.forkChild);
+    if (scenario === "timeout") {
+      yield* TestClock.adjust("1 second");
+      expect(yield* Fiber.join(fiber)).toMatchObject({ timedOut: true, run: { id: firstId } });
+      return;
+    }
+    // The old implementation returns immediately; race that against subscribing so red is an assertion.
+    const ready = yield* Deferred.await(subscribed).pipe(
+      Effect.as(true),
+      Effect.raceFirst(Fiber.join(fiber).pipe(Effect.as(false))),
+    );
+    expect(ready).toBe(true);
+    runs = [...runs, { id: nextId, ordinal: 2, status: "running" } as OrchestrationV2Run];
+    yield* Queue.offer(events, {
+      sequence: 1,
+      event: { type: "run.created", threadId, payload: runs[1] },
+    } as OrchestrationV2StoredEvent);
+    runs = [runs[0]!, { ...runs[1]!, status: "completed" }];
+    yield* Queue.offer(events, {
+      sequence: 2,
+      event: { type: "run.updated", threadId, payload: runs[1] },
+    } as OrchestrationV2StoredEvent);
+    expect(yield* Fiber.join(fiber)).toMatchObject({
+      timedOut: false,
+      run: { id: nextId, status: "completed" },
+    });
+  }),
+);
+
 it.effect("waitForThread follows a restart continuation instead of the cut run", () =>
   Effect.gen(function* () {
     const projectId = ProjectId.make("project:thread-management:wait-restart");
