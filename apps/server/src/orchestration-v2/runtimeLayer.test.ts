@@ -3728,16 +3728,16 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
       const ended = yield* watchOf;
       assert.isUndefined(ended?.watch);
       assert.isFalse(ended?.endedWatch?.passed);
+      // The pass it told on this head stays told while the check runs again.
+      assert.deepEqual(ended?.endedWatch?.passedChecks, ["lint"]);
       assert.deepEqual(yield* summaries, ["#13: new comments, stopped watching"]);
 
+      // Watching again resumes from the ended watch, so the same head passing again is not news.
       status = "success";
       yield* TestClock.adjust("10 minutes");
       yield* watch("again");
       yield* reactor.sweep;
-      assert.deepEqual(yield* summaries, [
-        "#13: new comments, stopped watching",
-        "#13: checks passed",
-      ]);
+      assert.deepEqual(yield* summaries, ["#13: new comments, stopped watching"]);
       yield* orchestrator.dispatch({
         type: "thread.pull-request.watch",
         commandId: CommandId.make("pr-watch-limit-end"),
