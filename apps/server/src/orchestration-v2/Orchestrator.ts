@@ -757,15 +757,34 @@ function legacyPullRequestLink(
 
 const DELEGATED_RESULT_INLINE_BYTES = 16_000;
 
+/** Earlier start first; a task that has not started sorts last. */
+function compareStartedAt(a: DateTime.Utc | null, b: DateTime.Utc | null): number {
+  if (a === null || b === null) return a === b ? 0 : a === null ? 1 : -1;
+  return DateTime.Order(a, b);
+}
+
 function delegatedCompletionWakeDetail(
   taskIds: ReadonlyArray<string>,
   tasks: ReadonlyArray<OrchestrationV2Subagent>,
+  originalTaskIds?: ReadonlyMap<ThreadId, NodeId>,
 ): string {
   let remainingBytes = DELEGATED_RESULT_INLINE_BYTES;
   return taskIds
     .map((taskId) => {
       const task = tasks.find((candidate) => candidate.id === taskId);
-      const label = `Delegated task ${taskId}${task?.title == null ? "" : ` (${task.title})`}${task === undefined ? " reached a terminal state" : ` [${task.status}]`}`;
+      const childThreadId = task?.childThreadId;
+      const original =
+        childThreadId == null
+          ? undefined
+          : (tasks.find((candidate) => candidate.id === originalTaskIds?.get(childThreadId)) ??
+            tasks
+              .filter((candidate) => candidate.childThreadId === childThreadId)
+              .toSorted((a, b) => compareStartedAt(a.startedAt, b.startedAt))[0]);
+      const followup =
+        original !== undefined && original.id !== taskId
+          ? `, a follow-up of task ${original.id} after the child ran again`
+          : "";
+      const label = `Delegated task ${taskId}${task?.title == null ? "" : ` (${task.title})`}${task === undefined ? " reached a terminal state" : ` [${task.status}]`}${followup}`;
       if (task?.result != null) {
         const detail = `${label}:\n${task.result}`;
         const bytes = Buffer.byteLength(detail);
@@ -6004,10 +6023,42 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         }
       }
     }
+    const originalTaskIds = new Map<ThreadId, NodeId>();
+    if (delegatedCompletion !== undefined) {
+      for (const taskId of delegatedCompletion.taskIds) {
+        const childThreadId = projection.subagents.find(
+          (task) => task.id === taskId,
+        )?.childThreadId;
+        if (childThreadId == null || originalTaskIds.has(childThreadId)) continue;
+        const child = yield* projectionStore
+          .getThread(childThreadId)
+          .pipe(mapDispatchError(command));
+        if (child.forkedFrom?.type === "node") {
+          originalTaskIds.set(childThreadId, child.forkedFrom.nodeId);
+        }
+      }
+    }
+    const originalTasks =
+      delegatedCompletion === undefined || originalTaskIds.size === 0
+        ? []
+        : (yield* projectionStore
+            .getThreadRecords(command.threadId, ["subagents"], {
+              subagentIds: [...originalTaskIds.values()],
+            })
+            .pipe(mapDispatchError(command))).subagents;
     const dispatchText =
       delegatedCompletion === undefined
         ? command.text
-        : delegatedCompletionWakeDetail(delegatedCompletion.taskIds, projection.subagents);
+        : delegatedCompletionWakeDetail(
+            delegatedCompletion.taskIds,
+            [
+              ...originalTasks.filter(
+                (original) => !projection.subagents.some((task) => task.id === original.id),
+              ),
+              ...projection.subagents,
+            ],
+            originalTaskIds,
+          );
     const sourcePlanProjection =
       command.sourcePlanRef === undefined
         ? null
@@ -12848,8 +12899,42 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       const parentTurnItem = parentProjection.turnItems.find(
         (candidate) => candidate.type === "subagent" && candidate.subagentId === task.id,
       );
+      const taskOrdinals = new Map<NodeId, number>();
+      taskOrdinals.set(forkedFrom.nodeId, 0);
+      for (const run of childControls.runs) {
+        if (run.delegatedTaskId !== undefined) {
+          taskOrdinals.set(
+            run.delegatedTaskId,
+            Math.min(taskOrdinals.get(run.delegatedTaskId) ?? run.ordinal, run.ordinal),
+          );
+        }
+      }
+      const compareTaskStart = (a: OrchestrationV2Subagent, b: OrchestrationV2Subagent) =>
+        compareStartedAt(a.startedAt, b.startedAt) ||
+        (taskOrdinals.get(a.id) ?? 0) - (taskOrdinals.get(b.id) ?? 0);
+      const previousTask = parentProjection.subagents
+        .filter(
+          (candidate) =>
+            candidate.id !== task.id &&
+            candidate.childThreadId === childThreadId &&
+            candidate.result !== null &&
+            compareTaskStart(candidate, task) < 0,
+        )
+        .toSorted((a, b) => compareTaskStart(b, a))[0];
+      const repeatsNotificationResult =
+        task.id !== forkedFrom.nodeId &&
+        childControls.messages.some(
+          (message) => message.id === childRun.userMessageId && message.notification !== undefined,
+        ) &&
+        previousTask !== undefined &&
+        previousTask.result?.trim() === result.text.trim();
       const updatedTask: OrchestrationV2Subagent = {
         ...task,
+        ...(repeatsNotificationResult
+          ? {
+              completionDelivery: { state: "acknowledged", observedByRunId: null },
+            }
+          : {}),
         providerThreadId: childRun.providerThreadId,
         status: terminalStatus,
         result: result.text,
