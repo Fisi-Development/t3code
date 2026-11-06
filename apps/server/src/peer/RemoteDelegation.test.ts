@@ -259,6 +259,14 @@ const boxToolkitLayer = (thread: BoxThread) => {
     getThreadRecords: (threadId) => projectionOf(threadId),
     waitForThread: (input) =>
       Effect.gen(function* () {
+        // This peer predates afterRunId; the D5 fake forwarding models a supporting peer.
+        if (input.afterRunId !== undefined) {
+          return {
+            threadId: input.threadId,
+            run: { id: input.afterRunId, status: "completed" } as OrchestrationV2Run,
+            timedOut: false,
+          };
+        }
         yield* Ref.update(thread.waitedFor, (seen) => [...seen, input.runId]);
         // A thread with no run has nothing to wait for.
         if (yield* Ref.get(thread.runless)) {
@@ -914,9 +922,23 @@ it.effect.each([
         Stream.filter((seen) => seen.length >= 2),
         Stream.runHead,
       );
-      expect(Option.getOrThrow(wakes)[1]?.detail).toContain(
-        `a follow-up of task ${before.delegated.taskId}`,
+      const completion = Option.getOrThrow(wakes)[1]!.delegatedCompletion!;
+      yield* a.orchestrator.dispatch({
+        type: "message.dispatch",
+        commandId: CommandId.make("command:deliver-remote-follow-up"),
+        threadId: parentThreadId,
+        messageId: completion.messageId,
+        text: "Delegated task reached a terminal state.",
+        attachments: [],
+        dispatchMode: { type: "queue_after_active" },
+        createdBy: "agent",
+        creationSource: "server",
+        delegatedCompletion: { ...completion, taskIds: [followUp.id] },
+      });
+      const delivered = (yield* a.orchestrator.getThreadProjection(parentThreadId)).messages.find(
+        (message) => message.id === completion.messageId,
       );
+      expect(delivered?.text).toContain(`a follow-up of task ${before.delegated.taskId}`);
     }),
   ).pipe(Effect.provide(NodeHttpServer.layerTest)),
 );

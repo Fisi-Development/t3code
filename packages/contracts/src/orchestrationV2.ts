@@ -868,6 +868,8 @@ export const OrchestrationV2RemoteTaskChild = Schema.Struct({
   label: Schema.String,
   /** The run there that carries the task; absent on tasks recorded before it was kept. */
   runId: Schema.optional(RunId),
+  followUpsUntil: Schema.optional(IsoDateTime),
+  resultRunId: Schema.optional(RunId),
   /**
    * Nothing is left to stop there: a stop reached it, was refused for good, or the thread
    * or link is gone. A run ending there by itself sets it too, unless the task here was
@@ -3450,6 +3452,7 @@ const OrchestrationV2InternalCommand = Schema.Union([
     parentThreadId: ThreadId,
     parentRunId: RunId,
     parentNodeId: NodeId,
+    followUpOf: Schema.optional(NodeId),
     task: TrimmedNonEmptyString,
     title: Schema.optional(TrimmedNonEmptyString),
     driver: ProviderDriverKind,
@@ -3468,6 +3471,8 @@ const OrchestrationV2InternalCommand = Schema.Union([
     commandId: CommandId,
     parentThreadId: ThreadId,
     taskId: NodeId,
+    followUpsUntil: Schema.optional(IsoDateTime),
+    resultRunId: Schema.optional(RunId),
     status: Schema.Literals(["completed", "failed", "cancelled", "interrupted"]),
     result: Schema.String,
     /**

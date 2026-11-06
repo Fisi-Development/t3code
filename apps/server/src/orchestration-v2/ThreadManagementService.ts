@@ -168,6 +168,7 @@ export interface ThreadManagementWaitInput {
   readonly projectId: ProjectId;
   readonly threadId: ThreadId;
   readonly runId?: RunId;
+  readonly afterRunId?: RunId;
   readonly timeoutMs: number;
   /**
    * Also wait until the thread's own delegated work settles: an ended run
@@ -917,28 +918,49 @@ const make = Effect.gen(function* () {
       .getThreadEventSequence(input.threadId)
       .pipe(Effect.mapError(loadError));
     const target = yield* getProjectThreadRecords(input, ["runs"]);
-    const selectedRun =
-      input.runId === undefined
-        ? latestRun(target)
-        : target.runs.find((candidate) => candidate.id === input.runId);
-    if (input.runId !== undefined && selectedRun === undefined) {
+    const afterRun =
+      input.afterRunId === undefined
+        ? undefined
+        : target.runs.find((run) => run.id === input.afterRunId);
+    if (input.afterRunId !== undefined && afterRun === undefined) {
+      return yield* new ThreadManagementRunNotFoundError({
+        threadId: input.threadId,
+        runId: input.afterRunId,
+      });
+    }
+    let selectedRun =
+      afterRun === undefined
+        ? input.runId === undefined
+          ? latestRun(target)
+          : target.runs.find((run) => run.id === input.runId)
+        : target.runs
+            .filter((run) => run.ordinal > afterRun.ordinal)
+            .toSorted((a, b) => a.ordinal - b.ordinal)[0];
+    if (input.runId !== undefined && input.afterRunId === undefined && selectedRun === undefined) {
       return yield* new ThreadManagementRunNotFoundError({
         threadId: input.threadId,
         runId: input.runId,
       });
     }
-    if (selectedRun === undefined) {
+    if (selectedRun === undefined && afterRun === undefined) {
       return { threadId: input.threadId, run: null, timedOut: false };
     }
     // A restart cuts a run and continues it as a new run. Follow that chain,
     // so a cut run is not the answer while its continuation is pending.
     // Runs per matching event and is already covered by the waitForThread span.
     const outcome = Effect.fnUntraced(function* (runs: ReadonlyArray<OrchestrationV2Run>) {
-      const current = runs.find((candidate) => candidate.id === selectedRun.id);
+      if (selectedRun === undefined && afterRun !== undefined) {
+        selectedRun = runs
+          .filter((run) => run.ordinal > afterRun.ordinal)
+          .toSorted((a, b) => a.ordinal - b.ordinal)[0];
+        if (selectedRun === undefined) return { run: afterRun, pending: false, settled: false };
+      }
+      const selectedId = selectedRun!.id;
+      const current = runs.find((candidate) => candidate.id === selectedId);
       if (current === undefined) {
         return yield* new ThreadManagementRunNotFoundError({
           threadId: input.threadId,
-          runId: selectedRun.id,
+          runId: selectedId,
         });
       }
       const run = latestRestartContinuation(runs, current);
@@ -992,6 +1014,7 @@ const make = Effect.gen(function* () {
       Stream.mergeAll(
         (
           [
+            "run.created",
             "run.updated",
             "thread.deleted",
             // What delegated work reads besides runs: tasks and their
@@ -1012,9 +1035,10 @@ const make = Effect.gen(function* () {
         Stream.mapError(loadError),
         Stream.filter(
           (stored) =>
+            afterRun !== undefined ||
             untilDelegatedWorkSettled ||
             stored.event.type !== "run.updated" ||
-            stored.event.payload.id === selectedRun.id ||
+            stored.event.payload.id === selectedRun?.id ||
             stored.event.payload.restartContinuationOfRunId !== undefined,
         ),
       ),

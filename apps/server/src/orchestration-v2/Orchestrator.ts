@@ -789,7 +789,15 @@ function delegatedCompletionWakeDetail(
       const childThreadId = task?.childThreadId;
       const original =
         childThreadId == null
-          ? undefined
+          ? task?.remoteChild === undefined
+            ? undefined
+            : tasks
+                .filter(
+                  (candidate) =>
+                    candidate.remoteChild?.environmentId === task.remoteChild!.environmentId &&
+                    candidate.remoteChild?.threadId === task.remoteChild!.threadId,
+                )
+                .toSorted((a, b) => compareStartedAt(a.startedAt, b.startedAt))[0]
           : (tasks.find((candidate) => candidate.id === originalTaskIds?.get(childThreadId)) ??
             tasks
               .filter((candidate) => candidate.childThreadId === childThreadId)
@@ -6052,6 +6060,23 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         }
       }
     }
+    const remoteOriginals: Array<OrchestrationV2Subagent> = [];
+    for (const taskId of delegatedCompletion?.taskIds ?? []) {
+      const remote = projection.subagents.find((task) => task.id === taskId)?.remoteChild;
+      if (
+        remote === undefined ||
+        remoteOriginals.some(
+          (task) =>
+            task.remoteChild?.environmentId === remote.environmentId &&
+            task.remoteChild.threadId === remote.threadId,
+        )
+      )
+        continue;
+      const records = yield* projectionStore
+        .getThreadRecords(command.threadId, ["subagents"], { subagentRemoteChild: remote })
+        .pipe(mapDispatchError(command));
+      remoteOriginals.push(...records.subagents);
+    }
     const originalTasks =
       delegatedCompletion === undefined || originalTaskIds.size === 0
         ? []
@@ -6066,7 +6091,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         : delegatedCompletionWakeDetail(
             delegatedCompletion.taskIds,
             [
-              ...originalTasks.filter(
+              ...[...originalTasks, ...remoteOriginals].filter(
                 (original) => !projection.subagents.some((task) => task.id === original.id),
               ),
               ...projection.subagents,
@@ -8431,7 +8456,11 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     events: Ref.Ref<Array<OrchestrationV2DomainEvent>>,
   ) {
     const parentProjection = yield* projectionStore
-      .getThreadRecords(command.parentThreadId, ["runs", "providerTurns", "attempts"])
+      .getThreadRecords(
+        command.parentThreadId,
+        ["runs", "providerTurns", "attempts", "subagents"],
+        { subagentIds: command.followUpOf === undefined ? [] : [command.followUpOf] },
+      )
       .pipe(
         Effect.mapError(
           (cause) => new OrchestratorProjectionError({ threadId: command.parentThreadId, cause }),
@@ -8440,7 +8469,27 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     const parentRun = parentProjection.runs.find(
       (candidate) => candidate.id === command.parentRunId,
     );
-    if (parentRun === undefined || !isActiveRun(parentRun) || parentRun.rootNodeId === null) {
+    if (command.followUpOf !== undefined) {
+      const original = parentProjection.subagents.find((task) => task.id === command.followUpOf);
+      if (
+        original?.result == null ||
+        original.remoteChild?.followUpsUntil === undefined ||
+        original.remoteChild.stoppedThere === false ||
+        original.remoteChild.environmentId !== command.remoteChild.environmentId ||
+        original.remoteChild.threadId !== command.remoteChild.threadId
+      ) {
+        return yield* new OrchestratorDispatchError({
+          commandId: command.commandId,
+          commandType: command.type,
+          cause: "The remote task's follow-up watch has ended.",
+        });
+      }
+    }
+    if (
+      parentRun === undefined ||
+      (!isActiveRun(parentRun) && command.followUpOf === undefined) ||
+      parentRun.rootNodeId === null
+    ) {
       return yield* new OrchestratorDispatchError({
         commandId: command.commandId,
         commandType: command.type,
@@ -8514,6 +8563,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         prompt: command.task,
         title: command.title ?? null,
         model: command.modelSelection.model,
+        modelSelection: command.modelSelection,
         ...(command.completionWake === undefined ? {} : { completionWake: command.completionWake }),
         status: "running",
         result: null,
@@ -8605,10 +8655,20 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       (command.stopCount ?? 0) !== (task.remoteChild?.stopCount ?? 0)
     )
       return;
+    const { followUpsUntil: _until, resultRunId: _resultRun, ...withoutWatch } = task.remoteChild!;
     const remoteChild =
       command.stoppedThere === undefined
         ? task.remoteChild
-        : { ...task.remoteChild!, stoppedThere: true };
+        : command.stoppedThere === "stopped"
+          ? { ...withoutWatch, stoppedThere: true }
+          : {
+              ...task.remoteChild!,
+              stoppedThere: true,
+              ...(command.followUpsUntil === undefined
+                ? {}
+                : { followUpsUntil: command.followUpsUntil }),
+              ...(command.resultRunId === undefined ? {} : { resultRunId: command.resultRunId }),
+            };
     // The first result stands; a repeated follower report records nothing, which
     // the dispatcher refuses. A stop there after the result is still recorded, but
     // a run that ended by itself does not settle a stop the task here still owes.
@@ -8622,7 +8682,8 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         task.status === "interrupted" ||
         task.remoteChild?.stoppedThere === false;
       if (
-        task.remoteChild?.stoppedThere === true ||
+        (task.remoteChild?.stoppedThere === true &&
+          !(command.stoppedThere === "stopped" && task.remoteChild.followUpsUntil !== undefined)) ||
         (owesStop && command.stoppedThere !== "stopped")
       )
         return;
@@ -8775,6 +8836,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     task: OrchestrationV2Subagent,
     remoteChild: OrchestrationV2RemoteTaskChild,
   ) {
+    const { followUpsUntil: _until, resultRunId: _resultRun, ...withoutWatch } = remoteChild;
     const now = yield* DateTime.now;
     yield* emit(
       events,
@@ -8789,7 +8851,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       payload: {
         ...task,
         remoteChild: {
-          ...remoteChild,
+          ...withoutWatch,
           stoppedThere: false,
           stopCount: (remoteChild.stopCount ?? 0) + 1,
         },

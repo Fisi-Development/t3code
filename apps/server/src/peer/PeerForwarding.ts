@@ -187,6 +187,7 @@ const make = Effect.gen(function* () {
       Math.max(1, input.timeoutMs ?? DEFAULT_WAIT_TIMEOUT_MS),
     );
     let runId = input.runId;
+    let afterRunId = input.afterRunId;
     while (true) {
       const chunk = Math.min(remaining, FORWARDED_WAIT_CHUNK_MS);
       const result = yield* forward<OrchestratorMcpThreadWaitResult>(
@@ -198,6 +199,7 @@ const make = Effect.gen(function* () {
         {
           threadId: input.threadId,
           ...(runId === undefined ? {} : { runId }),
+          ...(afterRunId === undefined ? {} : { afterRunId }),
           timeoutMs: chunk,
           ...(input.untilDelegatedWorkSettled === undefined
             ? {}
@@ -207,7 +209,10 @@ const make = Effect.gen(function* () {
       remaining -= chunk;
       if (!result.timedOut || remaining <= 0) return result;
       // Later pieces wait for the run the first one picked, not a newer one.
-      runId = result.runId ?? undefined;
+      if (afterRunId === undefined || result.runId !== afterRunId) {
+        runId = result.runId ?? undefined;
+        afterRunId = undefined;
+      }
     }
   });
 

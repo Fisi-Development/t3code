@@ -208,7 +208,7 @@ it.effect.each(["next", "timeout", "unknown"] as const)("afterRunId: %s", (scena
     const events = yield* Queue.unbounded<OrchestrationV2StoredEvent>();
     let runs = [
       { id: firstId, ordinal: 1, status: "completed" },
-    ] as ReadonlyArray<OrchestrationV2Run>;
+    ] as unknown as ReadonlyArray<OrchestrationV2Run>;
     const service = yield* ThreadManagementService.ThreadManagementService.pipe(
       Effect.provide(
         ThreadManagementService.layer.pipe(

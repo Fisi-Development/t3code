@@ -36,6 +36,7 @@ import type {
   OrchestrationV2Run,
   OrchestrationV2RuntimeRequest,
   OrchestrationV2Subagent,
+  OrchestrationV2RemoteTaskChild,
   OrchestrationV2ThreadShellSnapshot,
   OrchestrationV2ShellThreadStatus,
   OrchestrationV2ThreadShell,
@@ -353,6 +354,7 @@ export interface ProjectionRecordFilter {
   readonly contextTransferStatuses?: ReadonlyArray<OrchestrationV2ContextTransfer["status"]>;
   readonly subagentIds?: ReadonlyArray<NodeId>;
   readonly subagentRunIds?: ReadonlyArray<RunId>;
+  readonly subagentRemoteChild?: Pick<OrchestrationV2RemoteTaskChild, "environmentId" | "threadId">;
   readonly nodeIds?: ReadonlyArray<NodeId>;
   readonly turnItemRequestIds?: ReadonlyArray<RuntimeRequestId>;
   readonly turnItemTypes?: ReadonlyArray<OrchestrationV2TurnItem["type"]>;
@@ -3441,6 +3443,12 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
             WHERE thread_id = ${threadId}
               ${filter?.subagentIds === undefined ? sql`` : sql`AND subagent_id IN (SELECT value FROM json_each(${encodeIdList(filter.subagentIds)}))`}
               ${filter?.subagentRunIds === undefined ? sql`` : sql`AND run_id IN (SELECT value FROM json_each(${encodeIdList(filter.subagentRunIds)}))`}
+              ${
+                filter?.subagentRemoteChild === undefined
+                  ? sql``
+                  : sql`AND json_extract(payload_json, '$.remoteChild.environmentId') = ${filter.subagentRemoteChild.environmentId}
+                AND json_extract(payload_json, '$.remoteChild.threadId') = ${filter.subagentRemoteChild.threadId}`
+              }
               ${
                 filter?.omitSettledSubagents !== undefined
                   ? sql`AND (${
@@ -6695,11 +6703,14 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
         )
         .pipe(Effect.mapError((cause) => new ProjectionStoreSetupError({ cause })));
 
-    const getOpenRemoteDelegatedTasks: ProjectionStoreV2Shape["getOpenRemoteDelegatedTasks"] = sql<{
-      readonly thread_id: string;
-      readonly subagent_id: string;
-    }>`
-      SELECT thread_id, subagent_id FROM orchestration_v2_projection_subagents
+    const getOpenRemoteDelegatedTasks: ProjectionStoreV2Shape["getOpenRemoteDelegatedTasks"] =
+      Effect.gen(function* () {
+        const now = DateTime.formatIso(yield* DateTime.now);
+        return yield* sql<{
+          readonly thread_id: string;
+          readonly subagent_id: string;
+        }>`
+      SELECT thread_id, subagent_id FROM orchestration_v2_projection_subagents AS watched
       WHERE origin = 'app_owned'
         AND child_thread_id IS NULL
         AND json_type(payload_json, '$.remoteChild') = 'object'
@@ -6710,16 +6721,29 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
             AND json_type(payload_json, '$.remoteChild.stoppedThere') IS NOT 'true'
           )
           OR json_type(payload_json, '$.remoteChild.stoppedThere') = 'false'
+          OR (
+            json_extract(payload_json, '$.remoteChild.followUpsUntil') > ${now}
+            AND NOT EXISTS (
+              SELECT 1 FROM orchestration_v2_projection_subagents AS later
+              WHERE later.thread_id = watched.thread_id
+                AND later.subagent_id != watched.subagent_id
+                AND json_extract(later.payload_json, '$.remoteChild.environmentId') = json_extract(watched.payload_json, '$.remoteChild.environmentId')
+                AND json_extract(later.payload_json, '$.remoteChild.threadId') = json_extract(watched.payload_json, '$.remoteChild.threadId')
+                AND json_extract(later.payload_json, '$.remoteChild.runId') != json_extract(watched.payload_json, '$.remoteChild.runId')
+                AND later.rowid > watched.rowid
+            )
+          )
         )
     `.pipe(
-      Effect.map((rows) =>
-        rows.map((row) => ({
-          parentThreadId: ThreadId.make(row.thread_id),
-          taskId: NodeId.make(row.subagent_id),
-        })),
-      ),
-      Effect.mapError((cause) => new ProjectionStoreSetupError({ cause })),
-    );
+          Effect.map((rows) =>
+            rows.map((row) => ({
+              parentThreadId: ThreadId.make(row.thread_id),
+              taskId: NodeId.make(row.subagent_id),
+            })),
+          ),
+          Effect.mapError((cause) => new ProjectionStoreSetupError({ cause })),
+        );
+      });
 
     const getThreadsWithPullRequests: ProjectionStoreV2Shape["getThreadsWithPullRequests"] =
       Effect.fn("ProjectionStore.getThreadsWithPullRequests")(
