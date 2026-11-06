@@ -3165,94 +3165,155 @@ it.layer(layerTest)("delegated tasks across a server restart", (it) => {
     }),
   );
 
-  // Running does not prove prompt consumption in Claude; re-offer cut deliveries even when resuming the turn.
-  it.effect("re-offers a cut delivery even when a continuation resumes its turn", () =>
+  it.effect.each([
+    {
+      name: "D8_delivery_run_cancelled_after_it_started_is_not_sent_again",
+      started: true,
+      restart: false,
+    },
+    {
+      name: "D8_restart_during_a_started_delivery_does_not_resend_it",
+      started: true,
+      restart: true,
+    },
+    {
+      name: "D2_delivery_run_cancelled_before_it_started_is_redelivered_once",
+      started: false,
+      restart: false,
+    },
+  ])("$name", ({ name, started, restart }) =>
     Effect.gen(function* () {
       const orchestrator = yield* Orchestrator.OrchestratorV2;
       const eventSink = yield* EventSink.EventSinkV2;
       const now = yield* DateTime.now;
-      const seed = (name: string, continuationPending: boolean) =>
-        Effect.gen(function* () {
-          const threadId = ThreadId.make(`thread:${name}`);
-          const runId = RunId.make(`run:${name}`);
-          const taskId = NodeId.make(`node:${name}-task`);
-          const messageId = MessageId.make(`message:delegated-delivery:${threadId}`);
-          const deliveryRunId = RunId.make(`run:${name}:delivery`);
-          yield* seedParentWithTerminalTask({
-            threadId,
-            projectId: ProjectId.make(`project:${name}`),
-            runId,
-            rootNodeId: NodeId.make(`node:${name}-root`),
-            taskId,
-            deliveryState: "claimed",
-            completionWake: "always",
-            deliveryTaskIds: [taskId],
-            now,
-          });
-          yield* eventSink.writeWithEffects({
-            commandId: reconcileCommandId(name),
-            events: [
-              {
-                id: EventId.make(`event:${name}:delivery-message`),
-                type: "message.updated",
-                threadId,
-                runId: deliveryRunId,
-                occurredAt: now,
-                payload: {
-                  id: messageId,
-                  threadId,
-                  runId: deliveryRunId,
-                  nodeId: null,
-                  role: "user",
-                  text: `Delegated task ${taskId} reached a terminal state.`,
-                  attachments: [],
-                  streaming: false,
-                  createdBy: "agent",
-                  creationSource: "server",
-                  createdAt: now,
-                  updatedAt: now,
-                  delegatedCompletion: { parentRunId: runId, generation: 1, taskIds: [taskId] },
-                },
-              },
-              runEvent({
-                threadId,
-                runId: deliveryRunId,
-                ordinal: 2,
-                status: "cancelled",
-                now,
-                providerThreadId: parentProviderThreadId(threadId),
-                userMessageId: messageId,
-              }),
-            ],
-            effects: continuationPending
-              ? [
-                  {
-                    id: `effect:restart-continuation:${deliveryRunId}`,
-                    commandId: reconcileCommandId(name),
-                    threadId,
-                    request: { type: "provider-runtime.continue", sourceRunId: deliveryRunId },
-                  },
-                ]
-              : [],
-          });
-          return { threadId, runId, taskId };
+      const threadId = ThreadId.make(`thread:${name}`);
+      const runId = RunId.make(`run:${name}`);
+      const taskId = NodeId.make(`node:${name}-task`);
+      const messageId = MessageId.make(`message:delegated-delivery:${threadId}`);
+      const deliveryRunId = RunId.make(`run:${name}:delivery`);
+      yield* seedParentWithTerminalTask({
+        threadId,
+        projectId: ProjectId.make(`project:${name}`),
+        runId,
+        rootNodeId: NodeId.make(`node:${name}-root`),
+        taskId,
+        parentRunStatus: "completed",
+        deliveryState: "claimed",
+        completionWake: "always",
+        deliveryTaskIds: [taskId],
+        now,
+      });
+      yield* orchestrator.dispatch({
+        type: "message.dispatch",
+        commandId: CommandId.make(`command:${name}:delivery`),
+        threadId,
+        messageId,
+        text: "Delegated task finished.",
+        attachments: [],
+        dispatchMode: { type: "queue_after_active" },
+        createdBy: "agent",
+        creationSource: "server",
+        delegatedCompletion: { parentRunId: runId, generation: 1, taskIds: [taskId] },
+      });
+      const initial = yield* orchestrator.getThreadProjection(threadId);
+      const deliveryRun = initial.runs.find((run) => run.userMessageId === messageId)!;
+      assert.equal(deliveryRun.status, "starting");
+      assert.isNull(deliveryRun.startedAt);
+      const active = { ...deliveryRun, status: "running" as const, startedAt: now };
+      if (started) {
+        yield* eventSink.write({
+          events: [
+            {
+              ...runEvent({ threadId, runId: deliveryRun.id, ordinal: 2, status: "running", now }),
+              payload: active,
+            },
+          ],
         });
-      const cut = yield* seed("delivery-cut", false);
-      const resumed = yield* seed("delivery-resumed", true);
-
-      yield* orchestrator.recoverDelegatedTasks;
-
-      for (const seeded of [cut, resumed]) {
-        const projection = yield* orchestrator.getThreadProjection(seeded.threadId);
-        assert.deepEqual(
-          projection.subagents.find((row) => row.id === seeded.taskId)?.completionDelivery?.state,
-          "claimed",
-        );
-        const delivery = projection.runs.find((row) => row.id === seeded.runId)?.delegatedCompletion
-          ?.delivery;
-        assert.equal(delivery?.generation, 2);
-        assert.deepEqual(delivery?.taskIds, [seeded.taskId]);
       }
+      const afterSequence = yield* eventSink.latestSequence();
+      yield* eventSink.writeWithEffects({
+        commandId: restart ? reconcileCommandId(name) : CommandId.make(`command:${name}:cancel`),
+        events: [
+          {
+            ...runEvent({ threadId, runId: deliveryRun.id, ordinal: 2, status: "cancelled", now }),
+            payload: {
+              ...(started ? active : deliveryRun),
+              status: "cancelled",
+              completedAt: now,
+            },
+          },
+        ],
+        effects: restart
+          ? [
+              {
+                id: `effect:restart-continuation:${deliveryRunId}`,
+                commandId: reconcileCommandId(name),
+                threadId,
+                request: { type: "provider-runtime.continue", sourceRunId: deliveryRun.id },
+              },
+            ]
+          : [],
+      });
+      if (restart) yield* orchestrator.recoverDelegatedTasks;
+      yield* eventSink.stream({ afterSequence, eventType: "run.updated" }).pipe(
+        Stream.filter(
+          (stored) =>
+            stored.event.type === "run.updated" &&
+            stored.event.payload.id === runId &&
+            stored.event.payload.delegatedCompletion?.delivery?.generation !== 1,
+        ),
+        Stream.take(1),
+        Stream.runHead,
+      );
+      const settled = yield* orchestrator.getThreadProjection(threadId);
+      assert.equal(
+        settled.subagents.find((task) => task.id === taskId)?.completionDelivery?.state,
+        started ? "delivered" : "claimed",
+      );
+      if (!started) {
+        const next = settled.runs.find((run) => run.id === runId)!.delegatedCompletion!.delivery!;
+        assert.equal(next.generation, 2);
+        yield* orchestrator.dispatch({
+          type: "message.dispatch",
+          commandId: CommandId.make(`command:${name}:redelivery`),
+          threadId,
+          messageId: next.messageId,
+          text: "Delegated task finished.",
+          attachments: [],
+          dispatchMode: { type: "queue_after_active" },
+          createdBy: "agent",
+          creationSource: "server",
+          delegatedCompletion: {
+            parentRunId: runId,
+            generation: next.generation,
+            taskIds: [taskId],
+          },
+        });
+        const resent = yield* orchestrator.getThreadProjection(threadId);
+        const nextRun = resent.runs.find((run) => run.userMessageId === next.messageId)!;
+        yield* eventSink.write({
+          events: [
+            {
+              ...runEvent({ threadId, runId: nextRun.id, ordinal: 3, status: "completed", now }),
+              payload: { ...nextRun, status: "completed", startedAt: now, completedAt: now },
+            },
+          ],
+        });
+      }
+      yield* orchestrator.recoverDelegatedTasks;
+      yield* orchestrator.recoverDelegatedTasks;
+      const recovered = yield* orchestrator.getThreadProjection(threadId);
+      assert.equal(
+        recovered.subagents.find((task) => task.id === taskId)?.completionDelivery?.state,
+        "delivered",
+      );
+      assert.isNull(recovered.runs.find((run) => run.id === runId)?.delegatedCompletion?.delivery);
+      assert.lengthOf(
+        recovered.messages.filter((message) =>
+          message.delegatedCompletion?.taskIds.includes(taskId),
+        ),
+        started ? 1 : 2,
+      );
     }),
   );
 
