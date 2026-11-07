@@ -4,6 +4,7 @@ import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, it } from "@effect/vitest";
 import { AgentScope } from "@t3tools/shared/AgentScope";
 import {
+  CommandId,
   EnvironmentId,
   type ModelSelection,
   type OrchestrationV2AppThread,
@@ -32,6 +33,7 @@ import * as Ref from "effect/Ref";
 import * as Stream from "effect/Stream";
 import * as SqlClient from "effect/sql/SqlClient";
 import * as EffectWorker from "./EffectWorker.ts";
+import * as Orchestrator from "./Orchestrator.ts";
 import * as ProviderReplayHarness from "./testkit/ProviderReplayHarness.ts";
 import { TestClock } from "effect/testing";
 import { HttpServer } from "effect/http";
@@ -424,6 +426,7 @@ function unimplemented(detail: string) {
 const makeProviderAdapter = Effect.fnUntraced(function* (
   state: Ref.Ref<TestProviderRuntimeState>,
   options: {
+    readonly restartOnSelectionChange?: boolean;
     readonly failEventStream?: boolean;
     readonly capabilities?: OrchestrationV2ProviderCapabilities;
     readonly extensionStatuses?: OrchestrationV2ProviderSession["extensionStatuses"];
@@ -463,7 +466,10 @@ const makeProviderAdapter = Effect.fnUntraced(function* (
     instanceId: ProviderInstanceId.make("codex"),
     driver: CODEX_DRIVER,
     getCapabilities: () => Effect.succeed(options.capabilities ?? CodexCapabilities),
-    planSelectionTransition: () => Effect.succeed({ type: "apply_on_next_turn" }),
+    planSelectionTransition: () =>
+      Effect.succeed({
+        type: options.restartOnSelectionChange ? "restart_session" : "apply_on_next_turn",
+      }),
     openSession: (input) =>
       Effect.gen(function* () {
         if (options.spawnBeforeOpen === true) {
@@ -4592,6 +4598,135 @@ it.effect.each([
             ...(mode === "retry" ? { flakyReleaseWrites: flaky } : {}),
           }),
         ).pipe(Layer.provideMerge(layerTestDatabase)),
+      ),
+    );
+  }),
+);
+
+it.effect.each([
+  [
+    "a runtime-mode change that closes the session delivers one notice to a thread waiting on background work",
+    "runtime",
+    true,
+    "runtime mode changed",
+  ],
+  [
+    "a workspace change that closes the session delivers one notice to a thread waiting on background work",
+    "workspace",
+    true,
+    "workspace changed",
+  ],
+  [
+    "a model switch that closes the session delivers one notice to a thread waiting on background work",
+    "model",
+    true,
+    "provider or model selection changed",
+  ],
+  ["a runtime-mode change releases unawaited background work quietly", "runtime", false, null],
+  ["archiving a thread waiting on background work ends it without a notice", "archive", true, null],
+] as const)("%s", ([_name, change, awaited, reason]) =>
+  Effect.gen(function* () {
+    const state = yield* Ref.make(emptyState);
+    yield* Effect.gen(function* () {
+      const manager = yield* ProviderSessionManager.ProviderSessionManagerV2;
+      const eventSink = yield* EventSink.EventSinkV2;
+      const idAllocator = yield* IdAllocator.IdAllocatorV2;
+      const projections = yield* ProjectionStore.ProjectionStoreV2;
+      const orchestrator = yield* Orchestrator.OrchestratorV2;
+      const worker = yield* EffectWorker.OrchestrationEffectWorkerV2;
+      const sql = yield* SqlClient.SqlClient;
+      const now = yield* DateTime.now;
+      const threadId = ThreadId.make("thread:settings-background-notice");
+      const providerSessionId = yield* idAllocator.allocate.providerSession({
+        providerInstanceId: modelSelection.instanceId,
+        threadId,
+      });
+      yield* eventSink.write({
+        events: [
+          yield* makeThreadCreatedEvent({ idAllocator, threadId, now }),
+          {
+            id: yield* idAllocator.allocate.event({ threadId }),
+            type: "provider-thread.updated",
+            threadId,
+            occurredAt: now,
+            payload: {
+              ...makeProviderThread({ idAllocator, threadId, providerSessionId, now }),
+              pendingBackgroundTasks: [
+                {
+                  taskId: "b78m03be3",
+                  kind: "command",
+                  ...(awaited ? { awaited: true as const } : {}),
+                },
+              ],
+            },
+          },
+        ],
+      });
+      yield* manager.open({ threadId, providerSessionId, modelSelection, runtimePolicy });
+      assert.include(
+        (yield* projections.getThreadProjection(threadId)).providerSessions.map(
+          (session) => session.id,
+        ),
+        providerSessionId,
+      );
+      const command = { commandId: CommandId.make("settings-change"), threadId };
+      yield* orchestrator.dispatch(
+        change === "runtime"
+          ? { ...command, type: "thread.runtime-mode.set", runtimeMode: "approval-required" }
+          : change === "workspace"
+            ? { ...command, type: "thread.metadata.update", worktreePath: "/changed-workspace" }
+            : change === "model"
+              ? {
+                  ...command,
+                  type: "thread.model-selection.set",
+                  modelSelection: { ...modelSelection, model: "gpt-5.5" },
+                }
+              : { ...command, type: "thread.archive" },
+      );
+      yield* worker.drain();
+      const delivered = yield* projections.getThreadProjection(threadId);
+      const notices = delivered.messages.filter(
+        (message) => message.notification?.summary === "Background work stopped without a result",
+      );
+      assert.lengthOf(notices, reason === null ? 0 : 1);
+      assert.isEmpty(delivered.providerThreads[0]!.pendingBackgroundTasks ?? []);
+      assert.isFalse(yield* manager.isLive(providerSessionId));
+      if (reason !== null) {
+        assert.include(notices[0]!.text, "b78m03be3");
+        assert.include(notices[0]!.text, reason);
+        yield* sql`UPDATE orchestration_v2_effect_outbox SET status = 'pending', completed_at = NULL WHERE thread_id = ${threadId} AND effect_type = 'background-work.released'`;
+        yield* worker.drain();
+        assert.lengthOf(
+          (yield* projections.getThreadProjection(threadId)).messages.filter(
+            (message) =>
+              message.notification?.summary === "Background work stopped without a result",
+          ),
+          1,
+        );
+      }
+    }).pipe(
+      Effect.provide(
+        Layer.mergeAll(
+          ProviderReplayHarness.layerWithRegistry(
+            { name: "settings-background-notice" },
+            Layer.unwrap(
+              makeProviderAdapter(state, {
+                capabilities: {
+                  ...CodexCapabilities,
+                  sessions: {
+                    ...CodexCapabilities.sessions,
+                    supportsMultipleProviderThreadsPerSession: false,
+                    supportsRuntimeModeSwitchInSession: false,
+                  },
+                },
+                restartOnSelectionChange: true,
+              }).pipe(Effect.map(ProviderAdapterRegistry.layerSingle)),
+            ),
+            { databaseLayer: layerTestDatabase, runEffectWorker: false },
+          ),
+          layerTestStores,
+          IdAllocator.layer,
+        ).pipe(Layer.provideMerge(layerTestDatabase), Layer.provide(NodeCrypto.layer)),
       ),
     );
   }),
