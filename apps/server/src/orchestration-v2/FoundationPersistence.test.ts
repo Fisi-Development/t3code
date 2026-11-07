@@ -717,6 +717,32 @@ it.effect.each([false, true])("groups shutdown commits with rollback=%s", (fail)
 });
 
 it.layer(layerTest)("orchestration V2 foundation persistence", (it) => {
+  it.effect("a released-work notice row keeps the task ids an older build reads", () =>
+    Effect.gen(function* () {
+      const outbox = yield* EffectOutbox.EffectOutboxV2;
+      const sql = yield* SqlClient.SqlClient;
+      yield* outbox.enqueue([
+        {
+          id: "effect:legacy-release-row",
+          commandId: CommandId.make("command:legacy-release-row"),
+          threadId: ThreadId.make("thread:legacy-release-row"),
+          request: {
+            type: "background-work.released",
+            providerThreadId: ProviderThreadId.make("provider-thread:legacy-release-row"),
+            providerSessionId: ProviderSessionId.make("provider-session:legacy-release-row"),
+            reason: "idle_timeout",
+            tasks: [{ taskId: "task:one", kind: "command", awaited: true }],
+            releasedAt: yield* DateTime.now,
+          },
+        },
+      ]);
+      const rows = yield* sql<{
+        payload_json: string;
+      }>`SELECT payload_json FROM orchestration_v2_effect_outbox WHERE effect_id = 'effect:legacy-release-row'`;
+      assert.deepEqual(JSON.parse(rows[0]!.payload_json).taskIds, ["task:one"]);
+    }),
+  );
+
   it.effect("projects oversized tool bodies once before replay and live RPC retention", () =>
     Effect.scoped(
       Effect.gen(function* () {

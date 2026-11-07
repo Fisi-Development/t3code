@@ -622,6 +622,8 @@ function layerTest(input: {
   readonly spawnBeforeOpen?: boolean;
   readonly scopeCloseReached?: Deferred.Deferred<void>;
   readonly beforeClose?: Effect.Effect<void>;
+  readonly coverageGate?: Deferred.Deferred<void>;
+  readonly coverageReached?: Deferred.Deferred<void>;
   readonly serverSettingsLayer?: ReturnType<typeof ServerSettings.layerTest>;
   readonly projectServiceLayer?: Layer.Layer<ProjectService.ProjectService>;
 }) {
@@ -736,7 +738,22 @@ function layerTest(input: {
             Layer.provide(Layer.merge(layerConfiguredEventSink, layerTestStores)),
           ),
           layerConfiguredEventSink,
-          EffectOutbox.layer.pipe(Layer.provide(layerTestDatabase)),
+          input.coverageGate === undefined
+            ? EffectOutbox.layer.pipe(Layer.provide(layerTestDatabase))
+            : Layer.effect(
+                EffectOutbox.EffectOutboxV2,
+                Effect.gen(function* () {
+                  const delegate = yield* EffectOutbox.EffectOutboxV2;
+                  return EffectOutbox.EffectOutboxV2.of({
+                    ...delegate,
+                    listUnsettled: (query) =>
+                      delegate.listUnsettled(query).pipe(
+                        Effect.tap(() => Deferred.succeed(input.coverageReached!, undefined)),
+                        Effect.tap(() => Deferred.await(input.coverageGate!)),
+                      ),
+                  });
+                }),
+              ).pipe(Layer.provide(EffectOutbox.layer.pipe(Layer.provide(layerTestDatabase)))),
           IdAllocator.layer,
           layerProviderEventIngestorTest,
           layerConfiguredMcpRegistry,
@@ -4467,6 +4484,12 @@ it.effect.each([
     true,
     true,
   ],
+  [
+    "overlapping releases that both read before either writes tell the thread once",
+    "overlapping",
+    true,
+    true,
+  ],
   ["a restart after the notice ran does not note the same work again", "restart-after", true, true],
   ["a Stop for an earlier wait does not stand down a later notice", "earlier-stop", true, true],
   ["a user Stop after the release stands the notice down", "stop", true, false],
@@ -4491,6 +4514,8 @@ it.effect.each([
     const closing = yield* Deferred.make<void>();
     const resumeClose = yield* Deferred.make<void>();
     const pauseClose = yield* Ref.make(false);
+    const coverageGate = yield* Deferred.make<void>();
+    const coverageReached = yield* Deferred.make<void>();
     const flaky: FlakyReleaseWrites = {
       failing: yield* Ref.make<"none" | "session" | "session-and-requests">("session"),
       failures: yield* Queue.unbounded<void>(),
@@ -4690,6 +4715,46 @@ it.effect.each([
           runtimePolicy,
         });
         yield* manager.release({ providerSessionId, reason: "runtime_error" });
+      } else if (mode === "overlapping") {
+        yield* Ref.set(pauseClose, true);
+        const firstRelease = yield* manager
+          .release({ providerSessionId, reason: "idle_timeout" })
+          .pipe(Effect.forkChild);
+        yield* Deferred.await(closing);
+        yield* Ref.set(pauseClose, false);
+        const replacementSessionId = yield* idAllocator.allocate.providerSession({
+          threadId,
+          providerInstanceId: modelSelection.instanceId,
+        });
+        const current = (yield* projections.getThreadRecords(threadId, ["providerThreads"]))
+          .providerThreads[0]!;
+        yield* eventSink.write({
+          events: [
+            {
+              id: yield* idAllocator.allocate.event({ threadId }),
+              type: "provider-thread.updated",
+              threadId,
+              occurredAt: yield* DateTime.now,
+              payload: { ...current, providerSessionId: replacementSessionId },
+            },
+          ],
+        });
+        yield* manager.open({
+          threadId,
+          providerSessionId: replacementSessionId,
+          modelSelection,
+          runtimePolicy,
+        });
+        const secondRelease = yield* manager
+          .release({ providerSessionId: replacementSessionId, reason: "idle_timeout" })
+          .pipe(Effect.forkChild);
+        yield* Deferred.await(coverageReached);
+        yield* Deferred.succeed(resumeClose, undefined);
+        // Settle both release fibers at the coverage gate or the writer permit.
+        yield* TestClock.adjust("0 millis");
+        yield* Deferred.succeed(coverageGate, undefined);
+        yield* Fiber.join(firstRelease);
+        yield* Fiber.join(secondRelease);
       } else if (mode === "idle" || race) {
         yield* TestClock.adjust(
           mode === "stop" || mode === "stop-restart" ? "2 seconds" : "3 seconds",
@@ -4720,7 +4785,8 @@ it.effect.each([
       const effects = yield* sql<{ effect_id: string; payload_json: string }>`
         SELECT effect_id, payload_json FROM orchestration_v2_effect_outbox
         WHERE thread_id = ${threadId} AND effect_type = 'background-work.released'`;
-      assert.lengthOf(effects, notice || race ? 1 : 0, "notice effects persisted by the release");
+      if (mode !== "overlapping")
+        assert.lengthOf(effects, notice || race ? 1 : 0, "notice effects persisted by the release");
       const roster =
         (yield* projections.getThreadRecords(threadId, ["providerThreads"])).providerThreads[0]!
           .pendingBackgroundTasks ?? [];
@@ -4908,6 +4974,7 @@ it.effect.each([
           layerTest({
             state,
             releaseRosterWritten,
+            ...(mode === "overlapping" ? { coverageGate, coverageReached } : {}),
             beforeClose: Effect.gen(function* () {
               if (!(yield* Ref.get(pauseClose))) return;
               yield* Deferred.succeed(closing, undefined);
