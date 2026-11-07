@@ -5,7 +5,9 @@
 (* the wait: the child's result, a later run the child starts on its own   *)
 (* background work, a delivery run cancelled before the provider takes it, *)
 (* the linked follower failing, dying on a defect or running out of        *)
-(* retries, and a Codex goal that keeps starting turns.                    *)
+(* retries, a Codex goal that keeps starting turns, and the child's own    *)
+(* delegated task (a grandchild) whose completion starts the child again   *)
+(* after its result.                                                       *)
 (*                                                                         *)
 (* Fixed = FALSE models upstream main before this change; Fixed = TRUE     *)
 (* models it after. Each failure has its own invariant or property.      *)
@@ -18,7 +20,8 @@ CONSTANTS
     GoalActive,   \* the parent has an active Codex goal
     MaxFollowUps, \* how many times the child may wake itself after its result
     MaxRetries,   \* a finite follower retry schedule
-    RunCutAfterTake \* a delivery run can be cancelled after the provider took it (a restart)
+    RunCutAfterTake, \* a delivery run can be cancelled after the provider took it (a restart)
+    GrandchildWakes  \* the child has its own delegated task that completes after its result
 
 VARIABLES
     child,      \* "running" | "resulted"
@@ -124,6 +127,27 @@ ChildWakesItself(sameText) ==
                            /\ lastText' = ver
     /\ UNCHANGED <<child, consumed, follower, retries, recorded, spins>>
 
+(* The child's own delegated task G completes after the child's result.   *)
+(* T3 delivers G's completion into the child as a server message, and the  *)
+(* child runs again. If the child already read G's result (task_status in  *)
+(* a running turn), the queued delivery run is cancelled before it starts  *)
+(* (readFirst). Before the change Orchestrator.ts mayStartSubagentFollowup *)
+(* did not admit a delegated-completion delivery, so no follow-up task     *)
+(* tracked the run and the child's new answer reached no one (D12). After, *)
+(* the run is a follow-up; one that never started does not wake.          *)
+GrandchildDelivers(readFirst) ==
+    /\ GrandchildWakes /\ ~Remote /\ recorded /\ child = "resulted" /\ wakes < MaxFollowUps
+    /\ wakes' = wakes + 1
+    /\ LET task == IF wakes' = 1 THEN "F1" ELSE "F2"
+       IN IF readFirst
+            THEN UNCHANGED <<pending, lastText, produced>>
+            ELSE /\ produced' = produced + 1
+                 /\ IF Fixed
+                      THEN /\ pending' = pending \cup {Msg(task, "T0", produced + 1, 1)}
+                           /\ lastText' = produced + 1
+                      ELSE UNCHANGED <<pending, lastText>>
+    /\ UNCHANGED <<child, consumed, follower, retries, recorded, spins>>
+
 (* A delivery run cancelled before the provider took its input: the cohort *)
 (* re-arms it as the next generation (Orchestrator.ts successor wakes).     *)
 DeliveryRunCancelled(m) ==
@@ -165,6 +189,7 @@ Next ==
     \/ FollowerFails
     \/ FollowerDies
     \/ \E s \in BOOLEAN : ChildWakesItself(s)
+    \/ \E r \in BOOLEAN : GrandchildDelivers(r)
     \/ \E m \in pending : DeliveryRunCancelled(m) \/ ParentTakes(m)
     \/ GoalTurn
     \/ \E i \in 1..Len(consumed) : CancelledAfterTake(i)
