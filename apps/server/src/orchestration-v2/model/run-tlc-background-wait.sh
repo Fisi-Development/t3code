@@ -3,7 +3,7 @@
 #   before <cause>: the pre-change server (Fixed = FALSE) with one session-closing cause must
 #     break EveryWaitEnds.
 #   before race <name>: the round 2 server (Fixed = TRUE, Carried = FALSE) with one ordering
-#     around the notice effect must break EveryWaitEnds with the stated trace length.
+#     around the notice effect must break the named invariant with the stated trace length.
 #   after: the changed server (Carried = TRUE) with every cause and both races must check
 #     completely with no invariant or WaitEndsEventually violation.
 #   probe <name>: the after configuration must reach the case the probe names.
@@ -54,10 +54,16 @@ for cause in settle idle crash settings; do
 done
 
 # Round 2 (a66a6f18c2) with each ordering: the counterexamples the change removes.
-run before-race-replacement TRUE FALSE "$ALL_CAUSES" '{"replacement"}' "$INVARIANTS"
+# Each run checks only the invariant its row is about: in the restart run two
+# invariants break at the same depth, and TLC reports whichever a worker finds first.
+run before-race-replacement TRUE FALSE "$ALL_CAUSES" '{"replacement"}' "TypeOK EveryWaitEnds"
 expect_violation "before race replacement" EveryWaitEnds 7
-run before-race-restart TRUE FALSE "$ALL_CAUSES" '{"restart"}' "$INVARIANTS"
+run before-race-restart TRUE FALSE "$ALL_CAUSES" '{"restart"}' "TypeOK EveryWaitEnds"
 expect_violation "before race restart" EveryWaitEnds 6
+# A restart after the notice was dispatched and before it was acknowledged also stores a
+# restart note for the same work.
+run before-race-restart-note TRUE FALSE "$ALL_CAUSES" '{"restart"}' "TypeOK AtMostOneNote"
+expect_violation "before race restart, duplicate note" AtMostOneNote 6
 
 run after TRUE TRUE "$ALL_CAUSES" "$ALL_RACES" "$INVARIANTS" WaitEndsEventually
 if [ "$code" -eq 0 ] && grep -q 'Model checking completed. No error has been found.' "$TMP/after.txt"; then
