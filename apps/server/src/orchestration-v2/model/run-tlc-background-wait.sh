@@ -11,7 +11,7 @@
 set -u
 cd "$(dirname "$0")"
 JAR="$1"
-INVARIANTS="TypeOK AtMostOneOutcome AtMostOneNotice AtMostOneNote WakeOnlyOnNews NoticeOnlyOnNews EveryWaitEnds"
+INVARIANTS="TypeOK AtMostOneOutcome AtMostOneNotice AtMostOneNote WakeOnlyOnNews NoticeOnlyOnNews EveryWaitEnds RosterClearedAfterNotice"
 ALL_CAUSES='{"settle", "idle", "crash", "settings"}'
 ALL_RACES='{"replacement", "restart"}'
 TMP="$(mktemp -d)"
@@ -68,8 +68,9 @@ else
   status=1
 fi
 
-for probe in NoticeAfterReplacement NoticeAfterRestart StopStandsDown StopAcrossRestart \
-  ReplayOnce SettledStillHears FailedTurn RestartContinuation NativeWake; do
+for probe in NoticeAfterReplacement ReplacementReleasedBeforeNotice RestartBeforeNotice \
+  SettleBeforeNotice StopStandsDown StopAcrossRestart ReplayOnce ReplayAfterStandDown \
+  FailedTurn RestartContinuation NativeWake; do
   run "probe-$probe" TRUE TRUE "$ALL_CAUSES" "$ALL_RACES" "Probe$probe"
   expect_violation "probe $probe reachable" "Probe$probe"
 done
