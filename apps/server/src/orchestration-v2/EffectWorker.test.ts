@@ -601,7 +601,8 @@ it.effect("releases dead background tasks once their notice fails for good", () 
         dispatch: () => Effect.fail(new Error("database is locked") as never),
       },
       projectionStore: {
-        getThreadRecords: () => Effect.succeed({ providerThreads: [providerThread] } as never),
+        getThreadRecords: () =>
+          Effect.succeed({ providerThreads: [providerThread], turnItems: [] } as never),
       },
       eventSink: {
         writeIfProviderThreadUnchanged: (input) =>
@@ -689,7 +690,8 @@ it.effect("a notice whose roster cleanup keeps conflicting is retried, not dropp
           ]).pipe(Effect.as(undefined as never)),
       },
       projectionStore: {
-        getThreadRecords: () => Effect.succeed({ providerThreads: [providerThread] } as never),
+        getThreadRecords: () =>
+          Effect.succeed({ providerThreads: [providerThread], turnItems: [] } as never),
       },
       eventSink: {
         writeIfProviderThreadUnchanged: (input) =>

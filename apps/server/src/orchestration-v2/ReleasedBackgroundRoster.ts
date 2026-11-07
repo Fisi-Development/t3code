@@ -1,3 +1,8 @@
+import {
+  endCancelledTurnItem,
+  isBackgroundCapableTurnItemType,
+  isNonterminalTurnItemStatus,
+} from "./CancelledTurnItem.ts";
 import type { ProviderSessionId, ProviderThreadId, ThreadId } from "@t3tools/contracts";
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import * as DateTime from "effect/DateTime";
@@ -11,6 +16,7 @@ export const removeReleasedBackgroundTasks = Effect.fn("ReleasedBackgroundRoster
     readonly providerSessionId: ProviderSessionId;
     readonly providerThreadId: ProviderThreadId;
     readonly taskIds: ReadonlyArray<string>;
+    readonly endTurnItems?: boolean;
   }) {
     const projectionStore = yield* ProjectionStore.ProjectionStoreV2;
     const eventSink = yield* EventSink.EventSinkV2;
@@ -19,17 +25,49 @@ export const removeReleasedBackgroundTasks = Effect.fn("ReleasedBackgroundRoster
     for (let attempt = 0; attempt < 3; attempt++) {
       const projection = yield* projectionStore.getThreadRecords(input.threadId, [
         "providerThreads",
+        "runs",
+        "nodes",
+        "turnItems",
       ]);
       const providerThread = projection.providerThreads.find(
         (candidate) => candidate.id === input.providerThreadId,
       );
       const tasks = providerThread?.pendingBackgroundTasks ?? [];
       const remaining = tasks.filter((task) => !taskIds.has(task.taskId));
-      if (providerThread === undefined || remaining.length === tasks.length) return true;
       const now = yield* DateTime.now;
+      const itemEvents = [];
+      const cancelledNodeIds = new Set<string>();
+      if (input.endTurnItems) {
+        for (const item of projection.turnItems) {
+          if (
+            !isBackgroundCapableTurnItemType(item.type) ||
+            !isNonterminalTurnItemStatus(item.status) ||
+            !taskIds.has(item.nativeItemRef?.nativeId ?? "")
+          )
+            continue;
+          itemEvents.push(
+            ...(yield* endCancelledTurnItem({
+              item,
+              projection,
+              now,
+              cancelledNodeIds,
+              allocateEventId: () =>
+                idAllocator.allocate.event({
+                  threadId: input.threadId,
+                  providerSessionId: input.providerSessionId,
+                }),
+            })),
+          );
+        }
+      }
+      if (providerThread === undefined || remaining.length === tasks.length) {
+        if (itemEvents.length > 0) yield* eventSink.write({ events: itemEvents });
+        return true;
+      }
       const { committed } = yield* eventSink.writeIfProviderThreadUnchanged({
         expected: providerThread,
         events: [
+          ...itemEvents,
           {
             id: yield* idAllocator.allocate.event({
               threadId: input.threadId,

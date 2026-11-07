@@ -830,46 +830,60 @@ export const layerWithOptions = (
           providerThreadId,
           tasks: releasedTasks,
         } of input.releasedBackgroundTasks) {
-          const pending = yield* outbox
-            .listUnsettled({
-              threadId,
-              effectTypes: ["background-work.released"],
-            })
-            .pipe(
-              Effect.catchCause((cause) =>
-                Effect.logWarning("orchestration-v2.provider-session-release-outbox-read-failed", {
-                  threadId,
-                  providerThreadId,
-                  cause,
-                }).pipe(Effect.as([])),
+          for (let attempt = 0; attempt < 3; attempt++) {
+            const projection = yield* projectionStore.getThreadRecords(threadId, [
+              "providerThreads",
+            ]);
+            const current = projection.providerThreads.find(
+              (candidate) => candidate.id === providerThreadId,
+            );
+            if (current === undefined) break;
+            const rosterIds = new Set(
+              (current.pendingBackgroundTasks ?? []).map((task) => task.taskId),
+            );
+            const pending = yield* outbox
+              .listUnsettled({
+                threadId,
+                effectTypes: ["background-work.released"],
+              })
+              .pipe(
+                Effect.catchCause((cause) =>
+                  Effect.logWarning(
+                    "orchestration-v2.provider-session-release-outbox-read-failed",
+                    {
+                      threadId,
+                      providerThreadId,
+                      cause,
+                    },
+                  ).pipe(Effect.as([])),
+                ),
+              );
+            const covered = new Set(
+              pending.flatMap(({ request }) =>
+                request.type === "background-work.released" &&
+                request.providerThreadId === providerThreadId
+                  ? request.tasks.map((task) => task.taskId)
+                  : [],
               ),
             );
-          const covered = new Set(
-            pending.flatMap(({ request }) =>
-              request.type === "background-work.released" &&
-              request.providerThreadId === providerThreadId
-                ? request.tasks.map((task) => task.taskId)
-                : [],
-            ),
-          );
-          const tasks = releasedTasks.filter((task) => !covered.has(task.taskId));
-          const taskIds = tasks.map((task) => task.taskId);
-          // A turn that dies with its session already fails with the reason; a second wake would
-          // start another run and hand a delegating parent a second result.
-          const turnWasRunning = [...input.entry.busyTurns].some((turnKey) =>
-            turnKey.startsWith(busyTurnPrefix(providerThreadId)),
-          );
-          if (
-            (input.reason === "idle_timeout" ||
-              input.reason === "runtime_error" ||
-              (input.reason === "manual_shutdown" && input.notifyHeldBackgroundWork === true)) &&
-            !turnWasRunning &&
-            backgroundWorkHoldsCompletion(tasks)
-          ) {
-            const key = `background-work-released:${providerSessionId}:${providerThreadId}:${DateTime.toEpochMillis(input.releasedAt)}`;
-            yield* eventSink.writeWithEffects({
-              events: [],
-              effects: [
+            const tasks = releasedTasks.filter(
+              (task) => rosterIds.has(task.taskId) && !covered.has(task.taskId),
+            );
+            const taskIds = tasks.map((task) => task.taskId);
+            // A turn that dies with its session already fails with the reason; a second wake would
+            // start another run and hand a delegating parent a second result.
+            const turnWasRunning = [...input.entry.busyTurns].some((turnKey) =>
+              turnKey.startsWith(busyTurnPrefix(providerThreadId)),
+            );
+            if (
+              (input.reason === "idle_timeout" ||
+                input.reason === "runtime_error" ||
+                (input.reason === "manual_shutdown" && input.notifyHeldBackgroundWork === true)) &&
+              !turnWasRunning &&
+              backgroundWorkHoldsCompletion(tasks)
+            ) {
+              const key = `background-work-released:${providerSessionId}:${providerThreadId}:${DateTime.toEpochMillis(input.releasedAt)}`;
+              const effects: ReadonlyArray<EffectOutbox.PendingOrchestrationEffectV2> = [
                 {
                   id: `effect:${key}`,
                   commandId: CommandId.make(`command:${key}`),
@@ -884,19 +898,33 @@ export const layerWithOptions = (
                     ...(input.detail === undefined ? {} : { detail: input.detail }),
                   },
                 },
-              ],
-            });
-          } else {
-            yield* removeReleasedBackgroundTasks({
-              threadId,
-              providerSessionId,
-              providerThreadId,
-              taskIds,
-            }).pipe(
-              Effect.provideService(ProjectionStore.ProjectionStoreV2, projectionStore),
-              Effect.provideService(EventSink.EventSinkV2, eventSink),
-              Effect.provideService(IdAllocator.IdAllocatorV2, idAllocator),
-            );
+              ];
+              const { committed } = yield* eventSink.writeIfProviderThreadUnchanged({
+                expected: current,
+                events: [],
+                effects,
+              });
+              if (committed) break;
+              if (attempt === 2) {
+                yield* Effect.logWarning(
+                  "orchestration-v2.provider-session-release-notice-conflict",
+                  { threadId, providerThreadId },
+                );
+                yield* eventSink.writeWithEffects({ events: [], effects });
+              }
+            } else {
+              yield* removeReleasedBackgroundTasks({
+                threadId,
+                providerSessionId,
+                providerThreadId,
+                taskIds,
+              }).pipe(
+                Effect.provideService(ProjectionStore.ProjectionStoreV2, projectionStore),
+                Effect.provideService(EventSink.EventSinkV2, eventSink),
+                Effect.provideService(IdAllocator.IdAllocatorV2, idAllocator),
+              );
+              break;
+            }
           }
         }
       });

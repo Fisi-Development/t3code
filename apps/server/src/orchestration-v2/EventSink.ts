@@ -156,6 +156,7 @@ export interface EventSinkV2Shape {
   readonly writeIfProviderThreadUnchanged: (input: {
     readonly expected: OrchestrationV2ProviderThread;
     readonly events: ReadonlyArray<OrchestrationV2DomainEvent>;
+    readonly effects?: ReadonlyArray<EffectOutbox.PendingOrchestrationEffectV2>;
   }) => Effect.Effect<
     {
       readonly committed: boolean;
@@ -637,12 +638,15 @@ const layerBase: Layer.Layer<
           const normalized = yield* normalizeEvents(input.events);
           const storedEvents = yield* eventStore.append({ events: normalized });
           const outcomes = yield* applyStoredEvents(storedEvents);
+          yield* effectOutbox.enqueue(input.effects ?? []);
           return { committed: true as const, storedEvents, outcomes };
         }),
         (result) =>
-          result.committed
-            ? publishStoredEvents(result.storedEvents, result.outcomes)
-            : Effect.void,
+          Effect.gen(function* () {
+            if (!result.committed) return;
+            if (input.effects?.length) yield* effectOutbox.notifyAvailable(input.effects.length);
+            yield* publishStoredEvents(result.storedEvents, result.outcomes);
+          }),
       );
     });
 

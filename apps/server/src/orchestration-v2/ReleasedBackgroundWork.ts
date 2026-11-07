@@ -97,6 +97,7 @@ export const deliverReleasedBackgroundWork = Effect.fn("ReleasedBackgroundWork.d
       threadId: input.threadId,
       ...input.request,
       taskIds: input.request.tasks.map((task) => task.taskId),
+      endTurnItems: true,
     });
     if (!removed)
       return yield* new ReleasedBackgroundRosterConflictError({ effectId: input.effectId });
