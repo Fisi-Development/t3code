@@ -6,35 +6,46 @@
 (* The command lives in the provider process, so it ends with the session  *)
 (* (backgroundTasksEndWithProcess). The thread's projection keeps a roster *)
 (* entry for it; an awaited entry holds the thread Working. The agent      *)
-(* learns the outcome only from: a native task notification (wake), a      *)
-(* system notice written by the server (notice), a failed turn carrying    *)
-(* the reason (failed), or the restart continuation note (restartNoted).   *)
-(* A user Stop or archive ends the wait by the user's hand (stopped).      *)
+(* learns the outcome from: a native task notification (wake), a system   *)
+(* notice the server queues on the thread (notice), the turn that fails    *)
+(* with the session (failed), or the restart continuation run             *)
+(* (restartNoted). A user Stop or archive ends it by the user's hand.      *)
+(*                                                                         *)
+(* Abstraction: "delivered" means the outcome is in the thread and starts  *)
+(* or joins a run (the notice is queued with queue_after_active). A notice *)
+(* the server declines to dispatch because the provider instance is       *)
+(* disabled or the runtime mode is above the policy ceiling is out of      *)
+(* scope: no run can start on that thread until the user changes it.      *)
 (*                                                                         *)
 (* Fixed = FALSE is the server before the change: settle detaches any idle *)
 (* thread, and every session release clears the roster without a word.    *)
 (* Fixed = TRUE: settle refuses while an awaited entry holds the thread;   *)
 (* an idle release, a process exit, or a settings change that closes the  *)
-(* session writes one keyed notice effect and keeps the roster entry until *)
-(* the notice is delivered.                                                *)
+(* session with no turn running writes one keyed notice effect and keeps   *)
+(* the roster entry until that effect has run.                            *)
 (*                                                                         *)
-(* Events is the set of session-closing causes TLC may use, so each cause  *)
-(* can be checked alone against the pre-change server:                     *)
+(* Events: the session-closing causes TLC may use, so each can be checked  *)
+(* alone against the pre-change server.                                    *)
 (*   "settle"   - thread.settle (also sent by clients, not only by a user) *)
 (*   "idle"     - idle release: idle timeout or the idle pin expiry        *)
 (*   "crash"    - provider process exit or event stream failure           *)
 (*   "settings" - runtime mode, workspace, or model/provider change that  *)
 (*                closes the session                                       *)
-(* ReplacementRace = TRUE lets a new session take over the provider thread *)
-(* (and report its own empty roster) after the release but before the      *)
-(* notice effect runs.                                                     *)
+(* Races: orderings the change does not handle, each enabled on its own.   *)
+(*   "replacement" - a turn start queued on the thread before the notice   *)
+(*                   effect was inserted runs first (the outbox runs one   *)
+(*                   thread's effects in insertion order) and attaches a   *)
+(*                   new session to the provider thread                    *)
+(*   "restart"     - the server restarts after the release and before the  *)
+(*                   notice effect has run                                 *)
 (***************************************************************************)
 EXTENDS Naturals
 
-CONSTANTS Fixed, Events, ReplacementRace
+CONSTANTS Fixed, Events, Races
 
-ASSUME Fixed \in BOOLEAN /\ ReplacementRace \in BOOLEAN
+ASSUME Fixed \in BOOLEAN
 ASSUME Events \subseteq {"settle", "idle", "crash", "settings"}
+ASSUME Races \subseteq {"replacement", "restart"}
 
 VARIABLES
   roster,       \* projection roster entry: "none" | "unawaited" | "awaited"
@@ -42,24 +53,30 @@ VARIABLES
   proc,         \* the command itself: "running" | "done" | "killed"
   session,      \* provider session: "live" | "closed"
   turn,         \* "running" | "idle"
-  pending,      \* a notice effect sits in the outbox
+  pending,      \* the notice effect is in the outbox and not yet acknowledged
   keyUsed,      \* the notice key for this session lifetime was inserted
   noticeMsg,    \* the notice message (id derived from the key) exists
-  replays,      \* times the completed notice effect was executed again
+  replays,      \* times the acknowledged notice effect was executed again
   wakes, notices, failed, restartNoted,
-  stopped,      \* user Stop or archive
+  noteStored,   \* restart recovery stored the work for a later run, no run started
+  startQueued,  \* a turn start was queued before the notice effect was inserted
+  restarted,
+  stopped,      \* the user ended the open wait with Stop or archive
+  archived,
   settled,
   replaced      \* a replacement session owns the provider thread
 
-vars == <<roster, awaitedEver, proc, session, turn, pending, keyUsed, noticeMsg,
-          replays, wakes, notices, failed, restartNoted, stopped, settled, replaced>>
+vars == <<roster, awaitedEver, proc, session, turn, pending, keyUsed, noticeMsg, replays,
+          wakes, notices, failed, restartNoted, noteStored, startQueued, restarted,
+          stopped, archived, settled, replaced>>
 
 TypeOK ==
   /\ roster \in {"none", "unawaited", "awaited"}
   /\ proc \in {"running", "done", "killed"}
   /\ session \in {"live", "closed"}
   /\ turn \in {"running", "idle"}
-  /\ {pending, keyUsed, noticeMsg, awaitedEver, stopped, settled, replaced} \subseteq BOOLEAN
+  /\ {pending, keyUsed, noticeMsg, awaitedEver, noteStored, startQueued, restarted,
+      stopped, archived, settled, replaced} \subseteq BOOLEAN
   /\ {wakes, notices, failed, restartNoted, replays} \subseteq 0..3
 
 \* The agent has just started the command inside a running turn.
@@ -69,28 +86,30 @@ Init ==
   /\ proc = "running"
   /\ session = "live"
   /\ turn = "running"
-  /\ pending = FALSE
-  /\ keyUsed = FALSE
-  /\ noticeMsg = FALSE
-  /\ replays = 0
+  /\ pending = FALSE /\ keyUsed = FALSE /\ noticeMsg = FALSE /\ replays = 0
   /\ wakes = 0 /\ notices = 0 /\ failed = 0 /\ restartNoted = 0
-  /\ stopped = FALSE
-  /\ settled = FALSE
-  /\ replaced = FALSE
+  /\ noteStored = FALSE /\ startQueued = FALSE /\ restarted = FALSE
+  /\ stopped = FALSE /\ archived = FALSE /\ settled = FALSE /\ replaced = FALSE
+
+Open == proc = "running" \/ roster # "none"
+\* A Stop or archive after an outcome reached the agent ends that later run, not the wait.
+Delivered == wakes + notices + failed + restartNoted
 
 \* t3_background_wait matches the command in the live roster.
 Await ==
   /\ turn = "running" /\ session = "live" /\ roster = "unawaited" /\ proc = "running"
   /\ roster' = "awaited"
   /\ awaitedEver' = TRUE
-  /\ UNCHANGED <<proc, session, turn, pending, keyUsed, noticeMsg, replays, wakes,
-                 notices, failed, restartNoted, stopped, settled, replaced>>
+  /\ UNCHANGED <<proc, session, turn, pending, keyUsed, noticeMsg, replays, wakes, notices,
+                 failed, restartNoted, noteStored, startQueued, restarted, stopped,
+                 archived, settled, replaced>>
 
 EndTurn ==
   /\ turn = "running" /\ session = "live"
   /\ turn' = "idle"
   /\ UNCHANGED <<roster, awaitedEver, proc, session, pending, keyUsed, noticeMsg, replays,
-                 wakes, notices, failed, restartNoted, stopped, settled, replaced>>
+                 wakes, notices, failed, restartNoted, noteStored, startQueued, restarted,
+                 stopped, archived, settled, replaced>>
 
 \* The command finishes while its process lives; the provider delivers the task
 \* notification and a wake turn follows (also for unawaited commands).
@@ -99,8 +118,18 @@ Complete ==
   /\ proc' = "done"
   /\ roster' = "none"
   /\ wakes' = wakes + 1
-  /\ UNCHANGED <<awaitedEver, session, turn, pending, keyUsed, noticeMsg, replays,
-                 notices, failed, restartNoted, stopped, settled, replaced>>
+  /\ UNCHANGED <<awaitedEver, session, turn, pending, keyUsed, noticeMsg, replays, notices,
+                 failed, restartNoted, noteStored, startQueued, restarted, stopped,
+                 archived, settled, replaced>>
+
+\* A user message queues a turn start on the thread before any notice effect.
+QueueStart ==
+  /\ "replacement" \in Races
+  /\ ~startQueued /\ ~keyUsed /\ ~archived
+  /\ startQueued' = TRUE
+  /\ UNCHANGED <<roster, awaitedEver, proc, session, turn, pending, keyUsed, noticeMsg,
+                 replays, wakes, notices, failed, restartNoted, noteStored, restarted,
+                 stopped, archived, settled, replaced>>
 
 \* The release writes a notice instead of clearing the roster. A turn that dies
 \* with its session already fails with the reason, so it gets no notice.
@@ -110,7 +139,8 @@ Notifies(cause) ==
   /\ roster = "awaited"
   /\ turn = "idle"
 
-\* Closing the session ends the process and the command with it.
+\* Closing the session ends the process and the command with it; a running turn
+\* fails with the reason (outcome for an open wait).
 Release(cause) ==
   /\ session = "live"
   /\ session' = "closed"
@@ -121,15 +151,15 @@ Release(cause) ==
             /\ UNCHANGED roster
        ELSE /\ roster' = "none"
             /\ UNCHANGED <<pending, keyUsed>>
-  /\ failed' = IF cause = "crash" /\ turn = "running" /\ roster = "awaited"
-                THEN failed + 1 ELSE failed
+  /\ failed' = IF turn = "running" /\ roster = "awaited" THEN failed + 1 ELSE failed
   /\ turn' = "idle"
   /\ settled' = (settled \/ cause = "settle")
-  /\ UNCHANGED <<awaitedEver, noticeMsg, replays, wakes, notices, restartNoted, stopped, replaced>>
+  /\ UNCHANGED <<awaitedEver, noticeMsg, replays, wakes, notices, restartNoted, noteStored,
+                 startQueued, restarted, stopped, archived, replaced>>
 
 IdleRelease == "idle" \in Events /\ turn = "idle" /\ Release("idle")
 ProcessExit == "crash" \in Events /\ Release("crash")
-SettingsChange == "settings" \in Events /\ turn = "idle" /\ Release("settings")
+SettingsChange == "settings" \in Events /\ Release("settings")
 \* Settle rejects running turns; after the change it also rejects an awaited entry.
 Settle ==
   /\ "settle" \in Events
@@ -137,82 +167,115 @@ Settle ==
   /\ Fixed => roster # "awaited"
   /\ Release("settle")
 
-\* User Stop or archive ends the command by the user's hand.
+\* User Stop ends the command; the session stays.
 Stop ==
-  /\ ~stopped
-  /\ proc = "running" \/ roster # "none"
-  /\ stopped' = TRUE
+  /\ ~stopped /\ ~archived /\ Open
+  /\ stopped' = (Delivered = 0)
   /\ roster' = "none"
   /\ proc' = IF proc = "running" THEN "killed" ELSE proc
   /\ turn' = "idle"
-  /\ UNCHANGED <<awaitedEver, session, pending, keyUsed, noticeMsg, replays, wakes,
-                 notices, failed, restartNoted, settled, replaced>>
+  /\ UNCHANGED <<awaitedEver, session, pending, keyUsed, noticeMsg, replays, wakes, notices,
+                 failed, restartNoted, noteStored, startQueued, restarted, archived,
+                 settled, replaced>>
 
-\* Restart recovery lists the live session's roster in the continuation note.
-\* A session released before the restart is not live; its durable notice effect
-\* survives the restart and runs afterwards.
+\* Archive detaches the session; it ends a still-open wait by the user's hand.
+Archive ==
+  /\ ~archived
+  /\ archived' = TRUE
+  /\ stopped' = (stopped \/ (Open /\ Delivered = 0))
+  /\ roster' = "none"
+  /\ proc' = IF proc = "running" THEN "killed" ELSE proc
+  /\ session' = "closed"
+  /\ turn' = "idle"
+  /\ UNCHANGED <<awaitedEver, pending, keyUsed, noticeMsg, replays, wakes, notices, failed,
+                 restartNoted, noteStored, startQueued, restarted, settled, replaced>>
+
+\* Restart recovery clears every roster and records the work on the run. Only a
+\* session that was live at shutdown is eligible for the automatic continuation
+\* run; otherwise the note waits for a later run.
 ServerRestart ==
-  /\ session = "live"
+  /\ ~restarted
+  /\ session = "live" \/ ("restart" \in Races /\ pending)
+  /\ restarted' = TRUE
+  /\ IF session = "live"
+       THEN /\ restartNoted' = IF roster = "awaited" THEN restartNoted + 1 ELSE restartNoted
+            /\ UNCHANGED noteStored
+       ELSE /\ noteStored' = (noteStored \/ roster = "awaited")
+            /\ UNCHANGED restartNoted
+  /\ roster' = "none"
   /\ session' = "closed"
   /\ proc' = IF proc = "running" THEN "killed" ELSE proc
-  /\ restartNoted' = IF roster = "awaited" THEN restartNoted + 1 ELSE restartNoted
-  /\ roster' = "none"
   /\ turn' = "idle"
-  /\ UNCHANGED <<awaitedEver, pending, keyUsed, noticeMsg, replays, wakes, notices,
-                 failed, stopped, settled, replaced>>
+  /\ UNCHANGED <<awaitedEver, pending, keyUsed, noticeMsg, replays, wakes, notices, failed,
+                 startQueued, stopped, archived, settled, replaced>>
 
-\* A new session attaches to the provider thread and reports its own (empty)
-\* roster before the notice effect runs.
+\* The earlier queued start runs before the notice and attaches a new session to
+\* the provider thread.
 Replace ==
-  /\ ReplacementRace
-  /\ session = "closed" /\ ~replaced
+  /\ startQueued /\ pending /\ ~replaced /\ session = "closed"
   /\ replaced' = TRUE
-  /\ roster' = "none"
-  /\ UNCHANGED <<awaitedEver, proc, session, turn, pending, keyUsed, noticeMsg, replays,
-                 wakes, notices, failed, restartNoted, stopped, settled>>
+  /\ UNCHANGED <<roster, awaitedEver, proc, session, turn, pending, keyUsed, noticeMsg,
+                 replays, wakes, notices, failed, restartNoted, noteStored, startQueued,
+                 restarted, stopped, archived, settled>>
 
-\* The notice effect runs: one message per key, only while the released session
-\* still owns the provider thread and its roster still names the command, and
-\* not on an archived or settled thread. Then the entry is removed.
-Deliver ==
-  /\ pending
+\* The notice effect's handler, which may run more than once before it is
+\* acknowledged: it queues the message (id derived from the key) while the
+\* released session still owns the provider thread, the roster names the
+\* command, and the thread is not archived or settled.
+Sendable ==
+  roster = "awaited" /\ ~replaced /\ ~stopped /\ ~archived /\ ~settled
+
+DispatchNotice ==
+  /\ pending /\ Sendable /\ ~noticeMsg
+  /\ noticeMsg' = TRUE
+  /\ notices' = notices + 1
+  /\ UNCHANGED <<roster, awaitedEver, proc, session, turn, pending, keyUsed, replays, wakes,
+                 failed, restartNoted, noteStored, startQueued, restarted, stopped,
+                 archived, settled, replaced>>
+
+\* Then the handler removes the entry (only for the released session) and the
+\* effect is acknowledged.
+Acknowledge ==
+  /\ pending /\ (noticeMsg \/ ~Sendable)
   /\ pending' = FALSE
-  /\ IF roster = "awaited" /\ ~replaced /\ ~stopped /\ ~settled /\ ~noticeMsg
-       THEN /\ notices' = notices + 1
-            /\ noticeMsg' = TRUE
-       ELSE UNCHANGED <<notices, noticeMsg>>
   /\ roster' = IF replaced THEN roster ELSE "none"
-  /\ UNCHANGED <<awaitedEver, proc, session, turn, keyUsed, replays, wakes, failed,
-                 restartNoted, stopped, settled, replaced>>
+  /\ UNCHANGED <<awaitedEver, proc, session, turn, keyUsed, noticeMsg, replays, wakes,
+                 notices, failed, restartNoted, noteStored, startQueued, restarted, stopped,
+                 archived, settled, replaced>>
 
-\* Replay after process loss runs the completed notice effect again.
+\* Replay after process loss runs the acknowledged notice effect again.
 Replay ==
-  /\ noticeMsg /\ ~pending /\ replays = 0
+  /\ keyUsed /\ ~pending /\ replays = 0
   /\ pending' = TRUE
   /\ replays' = 1
-  /\ UNCHANGED <<roster, awaitedEver, proc, session, turn, keyUsed, noticeMsg, wakes,
-                 notices, failed, restartNoted, stopped, settled, replaced>>
+  /\ UNCHANGED <<roster, awaitedEver, proc, session, turn, keyUsed, noticeMsg, wakes, notices,
+                 failed, restartNoted, noteStored, startQueued, restarted, stopped,
+                 archived, settled, replaced>>
 
 Next ==
-  \/ Await \/ EndTurn \/ Complete
+  \/ Await \/ EndTurn \/ Complete \/ QueueStart
   \/ IdleRelease \/ ProcessExit \/ SettingsChange \/ Settle
-  \/ Stop \/ ServerRestart \/ Replace \/ Deliver \/ Replay
+  \/ Stop \/ Archive \/ ServerRestart \/ Replace
+  \/ DispatchNotice \/ Acknowledge \/ Replay
 
-Spec == Init /\ [][Next]_vars
+\* The effect worker eventually runs a pending effect to acknowledgement.
+Spec == Init /\ [][Next]_vars /\ WF_vars(DispatchNotice) /\ WF_vars(Acknowledge)
 
-Delivered == wakes + notices + failed + restartNoted
-
-(* At most one delivery per awaited event: one outcome reaches the agent, and   *)
-(* never more than one notice.                                                  *)
+(* Rule: at most one delivery per awaited event.                                 *)
 AtMostOneOutcome == Delivered + (IF stopped THEN 1 ELSE 0) <= 1
 AtMostOneNotice == notices <= 1
 
-(* No wake without news: a notice only for an awaited command that really ended *)
-(* without reporting.                                                           *)
-NoNoticeWithoutNews == notices > 0 => (awaitedEver /\ proc = "killed")
+(* Rule: no wake without news. A wake follows the command's completion; a notice *)
+(* follows an awaited command that ended without reporting.                      *)
+WakeOnlyOnNews == wakes > 0 => proc = "done"
+NoticeOnlyOnNews == notices > 0 => (awaitedEver /\ proc = "killed")
 
-(* Every wait reaches a delivered outcome: once the awaited command can no longer *)
-(* report and no notice is owed, the agent has heard, or the user ended it.     *)
+(* Rule: every wait reaches a delivered terminal outcome.                        *)
+(* Safety form: once the awaited command can no longer report and no notice      *)
+(* effect is owed, the agent has heard, or the user ended the wait.              *)
 EveryWaitEnds ==
   (awaitedEver /\ proc # "running" /\ ~pending) => (Delivered > 0 \/ stopped)
+(* Liveness form, under the worker fairness in Spec.                             *)
+WaitEndsEventually ==
+  [](awaitedEver /\ proc # "running" => <>(Delivered > 0 \/ stopped))
 =============================================================================

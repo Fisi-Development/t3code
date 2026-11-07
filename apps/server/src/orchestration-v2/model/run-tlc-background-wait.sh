@@ -1,66 +1,65 @@
 #!/bin/sh
-# Model-check BackgroundWait.tla. Before the change (Fixed = FALSE), each session-closing cause
-# alone must break EveryWaitEnds; after it (Fixed = TRUE), every cause together must hold every
-# invariant. A last run lets a replacement session take the provider thread before the notice
-# effect runs, and prints what TLC finds.
+# Model-check BackgroundWait.tla with TLC. Exits non-zero unless every run below ends as stated.
+#   before <cause>: the pre-change server (Fixed = FALSE) with one session-closing cause must
+#     break EveryWaitEnds.
+#   after: the changed server with every cause and no race must check completely with no
+#     invariant or WaitEndsEventually violation.
+#   race <name>: the changed server with one known unhandled ordering must still break
+#     EveryWaitEnds. These are open defects; once one is fixed, move it into the after run.
 # Usage: sh run-tlc-background-wait.sh /path/to/tla2tools.jar
 set -u
 cd "$(dirname "$0")"
 JAR="$1"
-INVARIANTS="TypeOK AtMostOneOutcome AtMostOneNotice NoNoticeWithoutNews EveryWaitEnds"
+INVARIANTS="TypeOK AtMostOneOutcome AtMostOneNotice WakeOnlyOnNews NoticeOnlyOnNews EveryWaitEnds"
+ALL_CAUSES='{"settle", "idle", "crash", "settings"}'
 TMP="$(mktemp -d)"
 cp BackgroundWait.tla "$TMP/"
 status=0
 
-cfg() {
-  # fixed, events, replacement race, invariants...
-  fixed="$1" events="$2" race="$3"
-  shift 3
-  printf 'CONSTANTS\n  Fixed = %s\n  Events = %s\n  ReplacementRace = %s\nSPECIFICATION Spec\n' \
-    "$fixed" "$events" "$race"
-  for inv in "$@"; do printf 'INVARIANT %s\n' "$inv"; done
+# name fixed events races [property]
+run() {
+  name="$1"
+  {
+    printf 'CONSTANTS\n  Fixed = %s\n  Events = %s\n  Races = %s\nSPECIFICATION Spec\n' "$2" "$3" "$4"
+    for inv in $INVARIANTS; do printf 'INVARIANT %s\n' "$inv"; done
+    if [ "${5:-}" != "" ]; then printf 'PROPERTY %s\n' "$5"; fi
+  } > "$TMP/$name.cfg"
+  (cd "$TMP" && java -XX:+UseParallelGC -cp "$JAR" tlc2.TLC -workers 2 -deadlock \
+    -config "$name.cfg" BackgroundWait.tla) > "$TMP/$name.txt" 2>&1
+  code=$?
+  summary="$(grep -E 'distinct states found' "$TMP/$name.txt" | tail -1)"
 }
 
-tlc() {
-  (cd "$TMP" && java -XX:+UseParallelGC -cp "$JAR" tlc2.TLC -workers 2 -deadlock -config "$1" BackgroundWait.tla) > "$TMP/out.txt" 2>&1
-}
-
-states() {
-  grep -E 'distinct states found, 0 states left' "$TMP/out.txt" | tail -1
+expect_violation() {
+  label="$1"
+  if grep -q '^Error: Invariant EveryWaitEnds is violated\.$' "$TMP/$name.txt" &&
+    ! grep -Eq '^Error: (Invariant (TypeOK|AtMost|WakeOnly|NoticeOnly)|.*[Pp]arse)' "$TMP/$name.txt"; then
+    echo "$label: EveryWaitEnds violated as expected, $(grep -c '^State [0-9]*:' "$TMP/$name.txt") states in the trace"
+  else
+    echo "$label: UNEXPECTED (TLC exit $code), see $TMP/$name.txt"
+    grep -E '^Error' "$TMP/$name.txt" | head -5
+    status=1
+  fi
 }
 
 for cause in settle idle crash settings; do
-  # shellcheck disable=SC2086
-  cfg FALSE "{\"$cause\"}" FALSE $INVARIANTS > "$TMP/before.cfg"
-  tlc before.cfg
-  if grep -q "is violated" "$TMP/out.txt"; then
-    echo "before $cause: $(grep 'is violated' "$TMP/out.txt" | head -1 | sed 's/^Error: //'), trace length $(grep -c '^State [0-9]*:' "$TMP/out.txt")"
-    cp "$TMP/out.txt" "$TMP/before-$cause.txt"
-  else
-    echo "before $cause: no violation (expected one); $(states)"
-    status=1
-  fi
+  run "before-$cause" FALSE "{\"$cause\"}" '{}'
+  expect_violation "before $cause"
 done
 
-# shellcheck disable=SC2086
-cfg TRUE '{"settle", "idle", "crash", "settings"}' FALSE $INVARIANTS > "$TMP/after.cfg"
-tlc after.cfg
-if grep -q "is violated" "$TMP/out.txt"; then
-  echo "after: VIOLATED"
-  sed -n '/is violated/,$p' "$TMP/out.txt" | head -80
-  status=1
+run after TRUE "$ALL_CAUSES" '{}' WaitEndsEventually
+if [ "$code" -eq 0 ] && grep -q 'Model checking completed. No error has been found.' "$TMP/after.txt"; then
+  echo "after: no violation of any invariant or WaitEndsEventually; $summary"
 else
-  echo "after: no violation; $(states)"
+  echo "after: FAILED (TLC exit $code), see $TMP/after.txt"
+  sed -n '/^Error/,$p' "$TMP/after.txt" | head -60
+  status=1
 fi
 
-# shellcheck disable=SC2086
-cfg TRUE '{"settle", "idle", "crash", "settings"}' TRUE $INVARIANTS > "$TMP/race.cfg"
-tlc race.cfg
-if grep -q "is violated" "$TMP/out.txt"; then
-  echo "after, replacement before delivery: $(grep 'is violated' "$TMP/out.txt" | head -1 | sed 's/^Error: //'), trace length $(grep -c '^State [0-9]*:' "$TMP/out.txt")"
-  cp "$TMP/out.txt" "$TMP/after-replacement.txt"
-else
-  echo "after, replacement before delivery: no violation; $(states)"
-fi
+for race in replacement restart; do
+  run "race-$race" TRUE "$ALL_CAUSES" "{\"$race\"}"
+  expect_violation "race $race (open defect)"
+done
+
 echo "TLC output kept in $TMP"
 exit "$status"
