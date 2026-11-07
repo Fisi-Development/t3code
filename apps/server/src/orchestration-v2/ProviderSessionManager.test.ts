@@ -19,6 +19,7 @@ import {
   type ProviderSessionId,
   ProviderTurnId,
   ThreadId,
+  TurnItemId,
 } from "@t3tools/contracts";
 import * as Cause from "effect/Cause";
 import * as DateTime from "effect/DateTime";
@@ -449,14 +450,19 @@ const makeProviderAdapter = Effect.fnUntraced(function* (
     readonly beforeUnload?: Effect.Effect<void>;
     readonly spawnBeforeOpen?: boolean;
     readonly scopeCloseReached?: Deferred.Deferred<void>;
+    readonly beforeClose?: Effect.Effect<void>;
   } = {},
 ) {
   const mcpSessions = yield* McpProviderSessions.McpProviderSessions;
   const countClose = Effect.addFinalizer(() =>
-    Ref.update(state, (current) => ({
-      ...current,
-      closeCount: current.closeCount + 1,
-    })),
+    (options.beforeClose ?? Effect.void).pipe(
+      Effect.andThen(
+        Ref.update(state, (current) => ({
+          ...current,
+          closeCount: current.closeCount + 1,
+        })),
+      ),
+    ),
   );
   // Register after countClose to wedge teardown before its finalizer, matching a provider stream that never yields.
   const hangClose = Effect.addFinalizer(() =>
@@ -615,6 +621,7 @@ function layerTest(input: {
   readonly beforeUnload?: Effect.Effect<void>;
   readonly spawnBeforeOpen?: boolean;
   readonly scopeCloseReached?: Deferred.Deferred<void>;
+  readonly beforeClose?: Effect.Effect<void>;
   readonly serverSettingsLayer?: ReturnType<typeof ServerSettings.layerTest>;
   readonly projectServiceLayer?: Layer.Layer<ProjectService.ProjectService>;
 }) {
@@ -664,6 +671,7 @@ function layerTest(input: {
   const layerRegistry = Layer.unwrap(
     makeProviderAdapter(input.state, {
       failEventStream: input.failEventStream ?? false,
+      ...(input.beforeClose === undefined ? {} : { beforeClose: input.beforeClose }),
       ...(input.capabilities === undefined ? {} : { capabilities: input.capabilities }),
       ...(input.extensionStatuses === undefined
         ? {}
@@ -4453,6 +4461,13 @@ it.effect.each([
     true,
     true,
   ],
+  [
+    "a second release that read the roster before the first notice ran does not tell the thread twice",
+    "late-release",
+    true,
+    true,
+  ],
+  ["a restart after the notice ran does not note the same work again", "restart-after", true, true],
   ["a Stop for an earlier wait does not stand down a later notice", "earlier-stop", true, true],
   ["a user Stop after the release stands the notice down", "stop", true, false],
   [
@@ -4473,6 +4488,9 @@ it.effect.each([
   Effect.gen(function* () {
     const state = yield* Ref.make(emptyState);
     const releaseRosterWritten = yield* Deferred.make<void>();
+    const closing = yield* Deferred.make<void>();
+    const resumeClose = yield* Deferred.make<void>();
+    const pauseClose = yield* Ref.make(false);
     const flaky: FlakyReleaseWrites = {
       failing: yield* Ref.make<"none" | "session" | "session-and-requests">("session"),
       failures: yield* Queue.unbounded<void>(),
@@ -4487,6 +4505,8 @@ it.effect.each([
       const race = [
         "replacement",
         "second-release",
+        "late-release",
+        "restart-after",
         "earlier-stop",
         "restart",
         "settle-restart",
@@ -4609,6 +4629,38 @@ it.effect.each([
         });
         yield* TestClock.adjust("1 second");
       }
+      const seedBackgroundItem = Effect.gen(function* () {
+        const run = (yield* projections.getThreadProjection(threadId)).runs[0]!;
+        yield* eventSink.write({
+          events: [
+            {
+              id: yield* idAllocator.allocate.event({ threadId }),
+              type: "turn-item.updated",
+              threadId,
+              occurredAt: now,
+              payload: {
+                id: TurnItemId.make("item:released-command"),
+                threadId,
+                runId: run.id,
+                nodeId: null,
+                providerThreadId: providerThread.id,
+                providerTurnId: ProviderTurnId.make("turn:released-notice"),
+                nativeItemRef: { driver: CODEX_DRIVER, nativeId: "b78m03be3", strength: "strong" },
+                type: "command_execution",
+                status: "running",
+                input: "background command",
+                parentItemId: null,
+                ordinal: 1,
+                title: null,
+                startedAt: now,
+                completedAt: null,
+                updatedAt: now,
+              },
+            },
+          ],
+        });
+      });
+      if (mode === "restart-after") yield* seedBackgroundItem;
       const afterSequence = yield* eventSink.latestSequence({ threadId });
       const runtime = yield* manager.open({
         threadId,
@@ -4684,7 +4736,7 @@ it.effect.each([
         );
         assert.equal(request.reason, mode === "crash" ? "runtime_error" : "idle_timeout");
       }
-      if (mode === "replacement" || mode === "second-release") {
+      if (mode === "replacement" || mode === "second-release" || mode === "late-release") {
         const replacementSessionId = yield* idAllocator.allocate.providerSession({
           threadId,
           providerInstanceId: modelSelection.instanceId,
@@ -4706,17 +4758,26 @@ it.effect.each([
             },
           ],
         });
-        if (mode === "second-release") {
+        if (mode === "second-release" || mode === "late-release") {
           yield* manager.open({
             threadId,
             providerSessionId: replacementSessionId,
             modelSelection,
             runtimePolicy,
           });
-          yield* manager.release({
-            providerSessionId: replacementSessionId,
-            reason: "idle_timeout",
-          });
+          if (mode === "late-release") yield* Ref.set(pauseClose, true);
+          const release = yield* manager
+            .release({
+              providerSessionId: replacementSessionId,
+              reason: "idle_timeout",
+            })
+            .pipe(Effect.forkChild);
+          if (mode === "late-release") {
+            yield* Deferred.await(closing);
+            yield* (yield* EffectWorker.OrchestrationEffectWorkerV2).drain();
+            yield* Deferred.succeed(resumeClose, undefined);
+          }
+          yield* Fiber.join(release);
         }
       }
       if (mode === "stop" || mode === "stop-restart") {
@@ -4726,6 +4787,9 @@ it.effect.each([
           threadId,
         });
       }
+      if (mode === "stop") yield* seedBackgroundItem;
+      if (mode === "restart-after")
+        yield* (yield* EffectWorker.OrchestrationEffectWorkerV2).drain();
       const stoppedAt = (yield* projections.getThreadProjection(threadId)).providerThreads.find(
         (thread) => thread.id === providerThread.id,
       )?.backgroundWorkStoppedAt;
@@ -4738,7 +4802,12 @@ it.effect.each([
           ),
         );
       }
-      if (mode === "restart" || mode === "settle-restart" || mode === "stop-restart") {
+      if (
+        mode === "restart" ||
+        mode === "settle-restart" ||
+        mode === "stop-restart" ||
+        mode === "restart-after"
+      ) {
         const recovery = yield* ProviderRuntimeRecovery.make.pipe(
           Effect.provide(
             Layer.mergeAll(
@@ -4776,6 +4845,12 @@ it.effect.each([
       );
       assert.lengthOf(notices, notice ? 1 : 0);
       assert.isEmpty(delivered.providerThreads[0]!.pendingBackgroundTasks ?? []);
+      if (mode === "restart-after" || mode === "stop") {
+        assert.equal(
+          delivered.turnItems.find((item) => item.id === "item:released-command")?.status,
+          "cancelled",
+        );
+      }
       if (mode === "replacement") {
         assert.isAbove(
           delivered.messages.indexOf(notices[0]!),
@@ -4833,6 +4908,11 @@ it.effect.each([
           layerTest({
             state,
             releaseRosterWritten,
+            beforeClose: Effect.gen(function* () {
+              if (!(yield* Ref.get(pauseClose))) return;
+              yield* Deferred.succeed(closing, undefined);
+              yield* Deferred.await(resumeClose);
+            }),
             idleTimeoutMs: 1000,
             maxIdlePinMs: 1000,
             hasPendingBackgroundWork: Effect.succeed(true),
