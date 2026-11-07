@@ -731,6 +731,7 @@ it.layer(layerTest)("orchestration V2 foundation persistence", (it) => {
             providerThreadId: ProviderThreadId.make("provider-thread:legacy-release-row"),
             providerSessionId: ProviderSessionId.make("provider-session:legacy-release-row"),
             reason: "idle_timeout",
+            taskIds: ["task:one"],
             tasks: [{ taskId: "task:one", kind: "command", awaited: true }],
             releasedAt: yield* DateTime.now,
           },
@@ -740,7 +741,7 @@ it.layer(layerTest)("orchestration V2 foundation persistence", (it) => {
         payload_json: string;
       }>`SELECT payload_json FROM orchestration_v2_effect_outbox WHERE effect_id = 'effect:legacy-release-row'`;
       assert.deepEqual(JSON.parse(rows[0]!.payload_json).taskIds, ["task:one"]);
-    }),
+    }).pipe(Effect.provide(layerIsolatedOutbox)),
   );
 
   it.effect("projects oversized tool bodies once before replay and live RPC retention", () =>

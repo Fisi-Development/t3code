@@ -37,6 +37,7 @@ export const OrchestrationEffectRequestV2 = Schema.Union([
     providerSessionId: ProviderSessionId,
     reason: Schema.Literals(["idle_timeout", "runtime_error", "detached"]),
     detail: Schema.optional(Schema.String),
+    taskIds: Schema.Array(Schema.String),
     tasks: Schema.Array(OrchestrationV2PendingBackgroundTask),
     releasedAt: Schema.DateTimeUtc,
   }),

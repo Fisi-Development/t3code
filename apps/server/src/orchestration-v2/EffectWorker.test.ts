@@ -622,6 +622,7 @@ it.effect("releases dead background tasks once their notice fails for good", () 
       threadId,
       request: {
         type: "background-work.released",
+        taskIds: ["b78m03be3"],
         providerThreadId,
         providerSessionId: oldSessionId,
         reason: "idle_timeout",
@@ -715,6 +716,7 @@ it.effect("a notice whose roster cleanup keeps conflicting is retried, not dropp
       threadId,
       request: {
         type: "background-work.released",
+        taskIds: ["b78m03be3"],
         providerThreadId,
         providerSessionId: oldSessionId,
         reason: "idle_timeout",

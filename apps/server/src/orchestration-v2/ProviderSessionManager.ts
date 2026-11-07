@@ -814,6 +814,7 @@ export const layerWithOptions = (
         ReturnType<typeof readReleasedBackgroundTasks>
       >[number];
 
+      const releasedBackgroundWorkPermit = yield* Semaphore.make(1);
       const writeReleasedBackgroundWorkEvents = Effect.fn(
         "ProviderSessionManager.writeReleasedBackgroundWorkEvents",
       )(function* (input: {
@@ -894,6 +895,7 @@ export const layerWithOptions = (
                     providerSessionId,
                     reason: input.reason === "manual_shutdown" ? "detached" : input.reason,
                     tasks,
+                    taskIds: tasks.map((task) => task.taskId),
                     releasedAt: input.releasedAt,
                     ...(input.detail === undefined ? {} : { detail: input.detail }),
                   },
@@ -927,7 +929,7 @@ export const layerWithOptions = (
             }
           }
         }
-      });
+      }, releasedBackgroundWorkPermit.withPermits(1));
 
       const writeReleaseRecords = (input: {
         readonly entry: LiveSessionEntry;
