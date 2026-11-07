@@ -728,6 +728,7 @@ function layerTest(input: {
             Layer.provide(Layer.merge(layerConfiguredEventSink, layerTestStores)),
           ),
           layerConfiguredEventSink,
+          EffectOutbox.layer.pipe(Layer.provide(layerTestDatabase)),
           IdAllocator.layer,
           layerProviderEventIngestorTest,
           layerConfiguredMcpRegistry,

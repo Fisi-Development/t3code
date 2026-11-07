@@ -2,10 +2,16 @@ import { CommandId, MessageId, type ThreadId } from "@t3tools/contracts";
 import { backgroundWorkHoldsCompletion } from "@t3tools/shared/orchestrationV2PendingBackgroundWork";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
+import * as Schema from "effect/Schema";
 import type { OrchestrationEffectRequestV2 } from "./EffectOutbox.ts";
 import { cancelledRosterTaskWork } from "./RestartBackgroundNote.ts";
 import { removeReleasedBackgroundTasks } from "./ReleasedBackgroundRoster.ts";
 import * as ThreadManagementService from "./ThreadManagementService.ts";
+
+export class ReleasedBackgroundRosterConflictError extends Schema.TaggedError<ReleasedBackgroundRosterConflictError>()(
+  "ReleasedBackgroundRosterConflictError",
+  { effectId: Schema.String },
+) {}
 
 export const deliverReleasedBackgroundWork = Effect.fn("ReleasedBackgroundWork.deliver")(
   function* (input: {
@@ -87,10 +93,12 @@ export const deliverReleasedBackgroundWork = Effect.fn("ReleasedBackgroundWork.d
           }),
         );
     }
-    yield* removeReleasedBackgroundTasks({
+    const removed = yield* removeReleasedBackgroundTasks({
       threadId: input.threadId,
       ...input.request,
       taskIds: input.request.tasks.map((task) => task.taskId),
     });
+    if (!removed)
+      return yield* new ReleasedBackgroundRosterConflictError({ effectId: input.effectId });
   },
 );

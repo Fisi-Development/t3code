@@ -25,7 +25,7 @@ export const removeReleasedBackgroundTasks = Effect.fn("ReleasedBackgroundRoster
       );
       const tasks = providerThread?.pendingBackgroundTasks ?? [];
       const remaining = tasks.filter((task) => !taskIds.has(task.taskId));
-      if (providerThread === undefined || remaining.length === tasks.length) return;
+      if (providerThread === undefined || remaining.length === tasks.length) return true;
       const now = yield* DateTime.now;
       const { committed } = yield* eventSink.writeIfProviderThreadUnchanged({
         expected: providerThread,
@@ -44,11 +44,12 @@ export const removeReleasedBackgroundTasks = Effect.fn("ReleasedBackgroundRoster
           },
         ],
       });
-      if (committed) return;
+      if (committed) return true;
     }
     yield* Effect.logWarning("orchestration-v2.provider-session-release-roster-conflict", {
       providerSessionId: input.providerSessionId,
       providerThreadId: input.providerThreadId,
     });
+    return false;
   },
 );

@@ -49,6 +49,7 @@ import * as McpProviderSessions from "@t3tools/provider-core/server/McpProviderS
 import * as ServerSettings from "../serverSettings.ts";
 import * as McpSessionRegistry from "../mcp/McpSessionRegistry.ts";
 import * as EventSink from "./EventSink.ts";
+import * as EffectOutbox from "./EffectOutbox.ts";
 import * as CommandOutputHub from "./CommandOutputHub.ts";
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import * as ProviderEventIngestor from "./ProviderEventIngestor.ts";
@@ -326,6 +327,7 @@ export const layerWithOptions = (
   never,
   | CommandOutputHub.CommandOutputHub
   | EventSink.EventSinkV2
+  | EffectOutbox.EffectOutboxV2
   | FileSystem.FileSystem
   | IdAllocator.IdAllocatorV2
   | McpProviderSessions.McpProviderSessions
@@ -345,6 +347,7 @@ export const layerWithOptions = (
       const serverSettings = yield* Effect.serviceOption(ServerSettings.ServerSettingsService);
       const projectService = yield* Effect.serviceOption(ProjectService.ProjectService);
       const eventSink = yield* EventSink.EventSinkV2;
+      const outbox = yield* EffectOutbox.EffectOutboxV2;
       const commandOutput = yield* CommandOutputHub.CommandOutputHub;
       const idAllocator = yield* IdAllocator.IdAllocatorV2;
       const providerEventIngestor = yield* ProviderEventIngestor.ProviderEventIngestorV2;
@@ -825,8 +828,31 @@ export const layerWithOptions = (
           threadId,
           providerSessionId,
           providerThreadId,
-          tasks,
+          tasks: releasedTasks,
         } of input.releasedBackgroundTasks) {
+          const pending = yield* outbox
+            .listUnsettled({
+              threadId,
+              effectTypes: ["background-work.released"],
+            })
+            .pipe(
+              Effect.catchCause((cause) =>
+                Effect.logWarning("orchestration-v2.provider-session-release-outbox-read-failed", {
+                  threadId,
+                  providerThreadId,
+                  cause,
+                }).pipe(Effect.as([])),
+              ),
+            );
+          const covered = new Set(
+            pending.flatMap(({ request }) =>
+              request.type === "background-work.released" &&
+              request.providerThreadId === providerThreadId
+                ? request.tasks.map((task) => task.taskId)
+                : [],
+            ),
+          );
+          const tasks = releasedTasks.filter((task) => !covered.has(task.taskId));
           const taskIds = tasks.map((task) => task.taskId);
           // A turn that dies with its session already fails with the reason; a second wake would
           // start another run and hand a delegating parent a second result.
