@@ -4446,6 +4446,13 @@ it.effect.each([
     true,
   ],
   ["a settle after a restart does not silence the owed notice", "settle-restart", true, true],
+  [
+    "a second release before the first notice runs does not tell the thread twice",
+    "second-release",
+    true,
+    true,
+  ],
+  ["a Stop for an earlier wait does not stand down a later notice", "earlier-stop", true, true],
   ["a user Stop after the release stands the notice down", "stop", true, false],
   [
     "a user Stop after the release stands the notice down across a restart",
@@ -4476,9 +4483,15 @@ it.effect.each([
       const projections = yield* ProjectionStore.ProjectionStoreV2;
       const sql = yield* SqlClient.SqlClient;
       const orchestrator = yield* Orchestrator.OrchestratorV2;
-      const race = ["replacement", "restart", "settle-restart", "stop", "stop-restart"].includes(
-        mode,
-      );
+      const race = [
+        "replacement",
+        "second-release",
+        "earlier-stop",
+        "restart",
+        "settle-restart",
+        "stop",
+        "stop-restart",
+      ].includes(mode);
       const now = yield* DateTime.now;
       const threadId = ThreadId.make("thread:released-notice");
       const providerSessionId = yield* idAllocator.allocate.providerSession({
@@ -4572,6 +4585,29 @@ it.effect.each([
           });
         }
       }
+      if (mode === "earlier-stop") {
+        yield* orchestrator.dispatch({
+          type: "thread.stop",
+          commandId: CommandId.make("command:earlier-stop"),
+          threadId,
+        });
+        const stopped = (yield* projections.getThreadProjection(threadId)).providerThreads[0]!;
+        yield* eventSink.write({
+          events: [
+            {
+              id: yield* idAllocator.allocate.event({ threadId }),
+              type: "provider-thread.updated",
+              threadId,
+              occurredAt: yield* DateTime.now,
+              payload: {
+                ...stopped,
+                pendingBackgroundTasks: [{ taskId: "later-work", kind: "command", awaited: true }],
+              },
+            },
+          ],
+        });
+        yield* TestClock.adjust("1 second");
+      }
       const afterSequence = yield* eventSink.latestSequence({ threadId });
       const runtime = yield* manager.open({
         threadId,
@@ -4602,7 +4638,9 @@ it.effect.each([
         });
         yield* manager.release({ providerSessionId, reason: "runtime_error" });
       } else if (mode === "idle" || race) {
-        yield* TestClock.adjust("3 seconds");
+        yield* TestClock.adjust(
+          mode === "stop" || mode === "stop-restart" ? "2 seconds" : "3 seconds",
+        );
       } else if (mode === "crash") {
         yield* eventSink
           .stream({ threadId, afterSequence, eventType: "provider-session.updated" })
@@ -4635,17 +4673,21 @@ it.effect.each([
           .pendingBackgroundTasks ?? [];
       assert.deepEqual(
         roster.map((task) => task.taskId),
-        notice || race ? ["b78m03be3"] : [],
+        notice || race ? [mode === "earlier-stop" ? "later-work" : "b78m03be3"] : [],
       );
       if (notice) {
         const request = JSON.parse(effects[0]!.payload_json);
         assert.deepEqual(
           request.tasks.map((task: { taskId: string }) => task.taskId),
-          ["b78m03be3"],
+          [mode === "earlier-stop" ? "later-work" : "b78m03be3"],
         );
         assert.equal(request.reason, mode === "crash" ? "runtime_error" : "idle_timeout");
       }
-      if (mode === "replacement") {
+      if (mode === "replacement" || mode === "second-release") {
+        const replacementSessionId = yield* idAllocator.allocate.providerSession({
+          threadId,
+          providerInstanceId: modelSelection.instanceId,
+        });
         const current = (yield* projections.getThreadRecords(threadId, [
           "providerThreads",
         ])).providerThreads.find((thread) => thread.id === providerThread.id)!;
@@ -4658,14 +4700,23 @@ it.effect.each([
               occurredAt: yield* DateTime.now,
               payload: {
                 ...current,
-                providerSessionId: yield* idAllocator.allocate.providerSession({
-                  threadId,
-                  providerInstanceId: modelSelection.instanceId,
-                }),
+                providerSessionId: replacementSessionId,
               },
             },
           ],
         });
+        if (mode === "second-release") {
+          yield* manager.open({
+            threadId,
+            providerSessionId: replacementSessionId,
+            modelSelection,
+            runtimePolicy,
+          });
+          yield* manager.release({
+            providerSessionId: replacementSessionId,
+            reason: "idle_timeout",
+          });
+        }
       }
       if (mode === "stop" || mode === "stop-restart") {
         yield* orchestrator.dispatch({
@@ -4677,7 +4728,15 @@ it.effect.each([
       const stoppedAt = (yield* projections.getThreadProjection(threadId)).providerThreads.find(
         (thread) => thread.id === providerThread.id,
       )?.backgroundWorkStoppedAt;
-      if (mode === "stop" || mode === "stop-restart") assert.isDefined(stoppedAt);
+      if (mode === "stop" || mode === "stop-restart") {
+        assert.isDefined(stoppedAt);
+        assert.equal(
+          DateTime.toEpochMillis(stoppedAt!),
+          DateTime.toEpochMillis(
+            DateTime.makeUnsafe(JSON.parse(effects[0]!.payload_json).releasedAt),
+          ),
+        );
+      }
       if (mode === "restart" || mode === "settle-restart" || mode === "stop-restart") {
         const recovery = yield* ProviderRuntimeRecovery.make.pipe(
           Effect.provide(
@@ -4733,24 +4792,25 @@ it.effect.each([
           String(notices[0]!.id),
           `message:${effects[0]!.effect_id.slice("effect:".length)}`,
         );
-        assert.include(notices[0]!.text, "b78m03be3");
+        assert.include(notices[0]!.text, mode === "earlier-stop" ? "later-work" : "b78m03be3");
         assert.include(
           notices[0]!.text,
           mode === "crash"
             ? "provider process exited unexpectedly"
             : "closed after a long time without activity",
         );
-        yield* sql`UPDATE orchestration_v2_effect_outbox SET status = 'pending', completed_at = NULL WHERE effect_id = ${effects[0]!.effect_id}`;
+        yield* sql`UPDATE orchestration_v2_effect_outbox SET status = 'pending', completed_at = NULL WHERE thread_id = ${threadId} AND effect_type = 'background-work.released'`;
         yield* (yield* EffectWorker.OrchestrationEffectWorkerV2).drain();
         assert.lengthOf(
           (yield* projections.getThreadProjection(threadId)).messages.filter(
-            (message) => message.id === notices[0]!.id,
+            (message) =>
+              message.notification?.summary === "Background work stopped without a result",
           ),
           1,
         );
       }
       if (race && !notice) {
-        yield* sql`UPDATE orchestration_v2_effect_outbox SET status = 'pending', completed_at = NULL WHERE effect_id = ${effects[0]!.effect_id}`;
+        yield* sql`UPDATE orchestration_v2_effect_outbox SET status = 'pending', completed_at = NULL WHERE thread_id = ${threadId} AND effect_type = 'background-work.released'`;
         yield* (yield* EffectWorker.OrchestrationEffectWorkerV2).drain();
         assert.isEmpty(
           (yield* projections.getThreadProjection(threadId)).messages.filter(

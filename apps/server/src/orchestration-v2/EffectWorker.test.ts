@@ -3,6 +3,7 @@ import {
   CheckpointId,
   CheckpointScopeId,
   CommandId,
+  type MessageId,
   NodeId,
   ProviderSessionId,
   ProviderThreadId,
@@ -647,6 +648,110 @@ it.effect("releases dead background tasks once their notice fails for good", () 
       );
       assert.deepEqual(yield* Ref.get(rosterWrites), [[]]);
     }).pipe(Effect.provide(layer));
+  }),
+);
+
+it.effect("a notice whose roster cleanup keeps conflicting is retried, not dropped", () =>
+  Effect.gen(function* () {
+    const timestamp = DateTime.formatIso(yield* DateTime.now);
+    const events = yield* Ref.make<ReadonlyArray<string>>([]);
+    const conflicts = yield* Ref.make(3);
+    const messages = yield* Ref.make<ReadonlyArray<{ id: MessageId }>>([]);
+    const acknowledgements = yield* Ref.make(0);
+    const retries = yield* Ref.make(0);
+    const rosterWrites = yield* Ref.make<ReadonlyArray<ReadonlyArray<string>>>([]);
+    const providerThread = {
+      id: providerThreadId,
+      providerSessionId: oldSessionId,
+      driver: "claudeAgent",
+      providerInstanceId: "claudeAgent",
+      pendingBackgroundTasks: [{ taskId: "b78m03be3", kind: "command", awaited: true }],
+    };
+    const layer = layerExecutorFor({
+      events,
+      threads: {
+        getThreadRecords: () =>
+          Ref.get(messages).pipe(
+            Effect.map(
+              (messages) =>
+                ({
+                  thread: { archivedAt: null, deletedAt: null, settledOverride: null },
+                  providerThreads: [providerThread],
+                  runs: [],
+                  messages,
+                }) as never,
+            ),
+          ),
+        dispatch: (input) =>
+          Ref.update(messages, (messages) => [
+            ...messages,
+            { id: (input as { messageId: MessageId }).messageId },
+          ]).pipe(Effect.as(undefined as never)),
+      },
+      projectionStore: {
+        getThreadRecords: () => Effect.succeed({ providerThreads: [providerThread] } as never),
+      },
+      eventSink: {
+        writeIfProviderThreadUnchanged: (input) =>
+          Effect.gen(function* () {
+            if ((yield* Ref.getAndUpdate(conflicts, (count) => Math.max(0, count - 1))) > 0)
+              return { committed: false, storedEvents: [] };
+            return yield* Ref.update(rosterWrites, (writes) => [
+              ...writes,
+              input.events.flatMap((event) =>
+                event.type === "provider-thread.updated"
+                  ? (event.payload.pendingBackgroundTasks ?? []).map((task) => task.taskId)
+                  : [],
+              ),
+            ]).pipe(Effect.as({ committed: true, storedEvents: [] }));
+          }),
+      },
+    });
+    const effect: EffectOutbox.OrchestrationEffectV2 = {
+      id: `effect:background-work-released:${oldSessionId}:${providerThreadId}:0`,
+      commandId: CommandId.make("command:background-work-released"),
+      threadId,
+      request: {
+        type: "background-work.released",
+        providerThreadId,
+        providerSessionId: oldSessionId,
+        reason: "idle_timeout",
+        tasks: [{ taskId: "b78m03be3", kind: "command", awaited: true }],
+        releasedAt: DateTime.makeUnsafe(timestamp),
+      },
+      status: "running",
+      attemptCount: 1,
+      availableAt: timestamp,
+      leaseOwner: "test-worker",
+      createdAt: timestamp,
+      updatedAt: timestamp,
+      completedAt: null,
+      lastError: null,
+    };
+    const outbox = Layer.mock(EffectOutbox.EffectOutboxV2)({
+      claimNext: () => Effect.succeedSome(effect),
+      get: () => Effect.succeedSome(effect),
+      awaitCancellation: () => Effect.never,
+      clearCancellation: () => Effect.void,
+      succeed: () => Ref.update(acknowledgements, (count) => count + 1).pipe(Effect.as(true)),
+      retry: () => Ref.update(retries, (count) => count + 1).pipe(Effect.as(true)),
+    });
+    yield* Effect.gen(function* () {
+      const worker = yield* EffectWorker.OrchestrationEffectWorkerV2;
+      yield* worker.runOnce;
+      assert.equal(yield* Ref.get(acknowledgements), 0);
+      assert.equal(yield* Ref.get(retries), 1);
+      assert.lengthOf(yield* Ref.get(messages), 1);
+      assert.isEmpty(yield* Ref.get(rosterWrites));
+      yield* worker.runOnce;
+      assert.equal(yield* Ref.get(acknowledgements), 1);
+      assert.lengthOf(yield* Ref.get(messages), 1);
+      assert.deepEqual(yield* Ref.get(rosterWrites), [[]]);
+    }).pipe(
+      Effect.provide(
+        EffectWorker.layerWithOptions().pipe(Layer.provide(Layer.merge(outbox, layer))),
+      ),
+    );
   }),
 );
 
