@@ -4639,7 +4639,10 @@ it.effect.each([
       );
       if (notice) {
         const request = JSON.parse(effects[0]!.payload_json);
-        assert.deepEqual(request.taskIds, ["b78m03be3"]);
+        assert.deepEqual(
+          request.tasks.map((task: { taskId: string }) => task.taskId),
+          ["b78m03be3"],
+        );
         assert.equal(request.reason, mode === "crash" ? "runtime_error" : "idle_timeout");
       }
       if (mode === "replacement") {
@@ -4671,6 +4674,10 @@ it.effect.each([
           threadId,
         });
       }
+      const stoppedAt = (yield* projections.getThreadProjection(threadId)).providerThreads.find(
+        (thread) => thread.id === providerThread.id,
+      )?.backgroundWorkStoppedAt;
+      if (mode === "stop" || mode === "stop-restart") assert.isDefined(stoppedAt);
       if (mode === "restart" || mode === "settle-restart" || mode === "stop-restart") {
         const recovery = yield* ProviderRuntimeRecovery.make.pipe(
           Effect.provide(
@@ -4688,6 +4695,12 @@ it.effect.each([
           "released work must not also be recorded as restart-cancelled",
         );
         assert.isEmpty(recovered.providerThreads[0]!.pendingBackgroundTasks ?? []);
+        if (mode === "stop-restart")
+          assert.deepEqual(
+            recovered.providerThreads.find((thread) => thread.id === providerThread.id)
+              ?.backgroundWorkStoppedAt,
+            stoppedAt,
+          );
       }
       if (mode === "settle-restart") {
         yield* orchestrator.dispatch({
@@ -4734,6 +4747,16 @@ it.effect.each([
             (message) => message.id === notices[0]!.id,
           ),
           1,
+        );
+      }
+      if (race && !notice) {
+        yield* sql`UPDATE orchestration_v2_effect_outbox SET status = 'pending', completed_at = NULL WHERE effect_id = ${effects[0]!.effect_id}`;
+        yield* (yield* EffectWorker.OrchestrationEffectWorkerV2).drain();
+        assert.isEmpty(
+          (yield* projections.getThreadProjection(threadId)).messages.filter(
+            (message) =>
+              message.notification?.summary === "Background work stopped without a result",
+          ),
         );
       }
     }).pipe(

@@ -293,6 +293,28 @@ export const make = Effect.gen(function* () {
           ),
         );
       const events: Array<OrchestrationV2DomainEvent> = [];
+      const releasedEffects = yield* outbox
+        .listUnsettled({
+          threadId: projection.thread.id,
+          effectTypes: ["background-work.released"],
+        })
+        .pipe(
+          Effect.mapError(
+            (cause) =>
+              new ProviderRuntimeRecoveryError({
+                operation: "reconcile",
+                threadId: projection.thread.id,
+                cause,
+              }),
+          ),
+        );
+      const coveredTaskIds = new Map<ProviderThreadId, Set<string>>();
+      for (const { request } of releasedEffects) {
+        if (request.type !== "background-work.released") continue;
+        const covered = coveredTaskIds.get(request.providerThreadId) ?? new Set<string>();
+        for (const task of request.tasks) covered.add(task.taskId);
+        coveredTaskIds.set(request.providerThreadId, covered);
+      }
       const cancelledBackgroundWork = new Map<
         ProviderThreadId,
         Array<OrchestrationV2RestartCancelledBackgroundWork>
@@ -312,6 +334,12 @@ export const make = Effect.gen(function* () {
       ) => {
         if (!isBackgroundCapableTurnItemType(item.type)) return;
         const awaitingId = awaitingProviderThreadId(item, projection.runs);
+        if (
+          awaitingId != null &&
+          item.nativeItemRef?.nativeId != null &&
+          coveredTaskIds.get(awaitingId)?.has(item.nativeItemRef.nativeId)
+        )
+          return;
         const ownProviderThread =
           item.providerThreadId === awaitingId
             ? undefined
@@ -678,6 +706,9 @@ export const make = Effect.gen(function* () {
           for (const task of providerThread.pendingBackgroundTasks ?? []) {
             // A subagent already recorded covers the shells it started.
             if (
+              coveredTaskIds.get(providerThread.id)?.has(task.taskId) ||
+              (task.parentTaskId !== undefined &&
+                coveredTaskIds.get(providerThread.id)?.has(task.parentTaskId)) ||
               cancelledBackgroundNativeIds.has(task.taskId) ||
               (task.parentTaskId !== undefined &&
                 cancelledBackgroundNativeIds.has(task.parentTaskId))

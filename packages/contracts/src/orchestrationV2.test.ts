@@ -421,6 +421,11 @@ describe("orchestration V2 contracts", () => {
     });
 
     expect(providerThread.pendingBackgroundTasks).toEqual([]);
+    expect(providerThread).not.toHaveProperty("backgroundWorkStoppedAt");
+    const stopped = { ...providerThread, backgroundWorkStoppedAt: now };
+    expect(
+      decodeOrchestrationV2ProviderThreadJson(encodeOrchestrationV2ProviderThreadJson(stopped)),
+    ).toEqual(stopped);
     expect(providerThread.contextUsage).toBeNull();
     expect(providerThread.nativeMetadata).toBeNull();
 

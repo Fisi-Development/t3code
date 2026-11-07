@@ -1101,6 +1101,7 @@ export const OrchestrationV2ProviderThread = Schema.Struct({
       checkpointId: Schema.optional(CheckpointId),
     }),
   ),
+  backgroundWorkStoppedAt: Schema.optional(Schema.DateTimeUtc),
   pendingBackgroundTasks: Schema.optional(Schema.Array(OrchestrationV2PendingBackgroundTask)).pipe(
     Schema.withDecodingDefault(Effect.succeed([])),
   ),
@@ -2369,6 +2370,7 @@ export type OrchestrationV2ProviderSessionDetachedJson =
 export const OrchestrationV2ProviderThreadJson = OrchestrationV2ProviderThread.mapFields(
   (fields) => ({
     ...fields,
+    backgroundWorkStoppedAt: Schema.optional(Schema.DateTimeUtcFromString),
     createdAt: Schema.DateTimeUtcFromString,
     updatedAt: Schema.DateTimeUtcFromString,
   }),

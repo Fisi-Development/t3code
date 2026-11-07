@@ -1,5 +1,6 @@
 import { CommandId, MessageId, type ThreadId } from "@t3tools/contracts";
 import { backgroundWorkHoldsCompletion } from "@t3tools/shared/orchestrationV2PendingBackgroundWork";
+import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import type { OrchestrationEffectRequestV2 } from "./EffectOutbox.ts";
 import { cancelledRosterTaskWork } from "./RestartBackgroundNote.ts";
@@ -26,22 +27,14 @@ export const deliverReleasedBackgroundWork = Effect.fn("ReleasedBackgroundWork.d
     const providerThread = projection.providerThreads.find(
       (candidate) => candidate.id === input.request.providerThreadId,
     );
-    if (
-      providerThread === undefined ||
-      providerThread.providerSessionId !== input.request.providerSessionId
-    )
-      return;
-    const taskIds = new Set(input.request.taskIds);
-    const tasks = (providerThread.pendingBackgroundTasks ?? []).filter((task) =>
-      taskIds.has(task.taskId),
-    );
-    if (tasks.length === 0) return;
-    const held = tasks.filter((task) => backgroundWorkHoldsCompletion([task]));
+    const held = input.request.tasks.filter((task) => backgroundWorkHoldsCompletion([task]));
     if (
       held.length > 0 &&
       projection.thread.archivedAt === null &&
       projection.thread.deletedAt === null &&
-      projection.thread.settledOverride !== "settled" &&
+      (providerThread?.backgroundWorkStoppedAt === undefined ||
+        DateTime.toEpochMillis(providerThread.backgroundWorkStoppedAt) <
+          DateTime.toEpochMillis(input.request.releasedAt)) &&
       !projection.messages.some((message) => message.id === messageId)
     ) {
       const detail = input.request.detail
@@ -97,7 +90,7 @@ export const deliverReleasedBackgroundWork = Effect.fn("ReleasedBackgroundWork.d
     yield* removeReleasedBackgroundTasks({
       threadId: input.threadId,
       ...input.request,
-      onlyForReleasedSession: true,
+      taskIds: input.request.tasks.map((task) => task.taskId),
     });
   },
 );

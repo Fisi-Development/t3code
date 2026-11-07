@@ -1,4 +1,5 @@
 import {
+  OrchestrationV2PendingBackgroundTask,
   CheckpointId,
   CheckpointScopeId,
   CommandId,
@@ -36,7 +37,8 @@ export const OrchestrationEffectRequestV2 = Schema.Union([
     providerSessionId: ProviderSessionId,
     reason: Schema.Literals(["idle_timeout", "runtime_error", "detached"]),
     detail: Schema.optional(Schema.String),
-    taskIds: Schema.Array(Schema.String),
+    tasks: Schema.Array(OrchestrationV2PendingBackgroundTask),
+    releasedAt: Schema.DateTimeUtc,
   }),
   Schema.Struct({
     type: Schema.Literal("provider-runtime.continue"),
@@ -202,6 +204,8 @@ export class EffectOutboxError extends Schema.TaggedError<EffectOutboxError>()(
   }
 }
 
+const UNSETTLED_EFFECT_STATUSES = ["pending", "running"] as const;
+
 const isEffectOutboxError = Schema.is(EffectOutboxError);
 
 export interface EffectOutboxV2Shape {
@@ -217,6 +221,10 @@ export interface EffectOutboxV2Shape {
   readonly listByCommandId: (
     commandId: CommandId,
   ) => Effect.Effect<ReadonlyArray<OrchestrationEffectV2>, EffectOutboxError>;
+  readonly listUnsettled: (input: {
+    readonly threadId: ThreadId;
+    readonly effectTypes: ReadonlyArray<OrchestrationEffectRequestV2["type"]>;
+  }) => Effect.Effect<ReadonlyArray<OrchestrationEffectV2>, EffectOutboxError>;
   readonly cancelUnsettled: (input: {
     readonly threadId: ThreadId;
     readonly effectTypes: ReadonlyArray<OrchestrationEffectRequestV2["type"]>;
@@ -274,9 +282,11 @@ type EffectRow = {
   readonly last_error: string | null;
 };
 
-const encodeRequest = Schema.encodeSync(Schema.fromJsonString(OrchestrationEffectRequestV2));
+const encodeRequest = Schema.encodeSync(
+  Schema.fromJsonString(Schema.toCodecJson(OrchestrationEffectRequestV2)),
+);
 const decodeRequest = Schema.decodeUnknownEffect(
-  Schema.fromJsonString(OrchestrationEffectRequestV2),
+  Schema.fromJsonString(Schema.toCodecJson(OrchestrationEffectRequestV2)),
 );
 
 const rowToEffect = (row: EffectRow) =>
@@ -446,6 +456,20 @@ export const layer: Layer.Layer<EffectOutboxV2, never, SqlClient.SqlClient> = La
               : new EffectOutboxError({ operation: "list", cause }),
           ),
         ),
+      listUnsettled: Effect.fn("EffectOutbox.listUnsettled")(
+        function* ({ threadId, effectTypes }) {
+          if (effectTypes.length === 0) return [];
+          const rows = yield* sql<EffectRow>`
+            SELECT * FROM orchestration_v2_effect_outbox
+            WHERE thread_id = ${threadId}
+              AND status IN ${sql.in(UNSETTLED_EFFECT_STATUSES)}
+              AND effect_type IN ${sql.in(effectTypes)}
+            ORDER BY created_at ASC, effect_id ASC
+          `.pipe(NodeSqliteClient.readOnly);
+          return yield* decodeRows("list-unsettled", rows);
+        },
+        Effect.mapError((cause) => new EffectOutboxError({ operation: "list-unsettled", cause })),
+      ),
       cancelUnsettled: Effect.fn("EffectOutbox.cancelUnsettled")(
         function* ({ threadId, effectTypes, reason }) {
           if (effectTypes.length === 0) return [];
@@ -459,7 +483,7 @@ export const layer: Layer.Layer<EffectOutboxV2, never, SqlClient.SqlClient> = La
               updated_at = ${now},
               last_error = ${reason}
             WHERE thread_id = ${threadId}
-              AND status IN ('pending', 'running')
+              AND status IN ${sql.in(UNSETTLED_EFFECT_STATUSES)}
               AND effect_type IN ${sql.in(effectTypes)}
             RETURNING effect_id
           `;

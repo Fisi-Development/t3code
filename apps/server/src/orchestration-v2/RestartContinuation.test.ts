@@ -276,6 +276,7 @@ it.effect.each([
               runRecoveryOnce: Effect.succeed(false),
             }),
             Layer.mock(EffectOutbox.EffectOutboxV2)({
+              listUnsettled: () => Effect.succeed([]),
               reconcileAfterProcessLoss: Effect.succeed({ requeued: 0, cancelled: 0 }),
             }),
           ),
@@ -337,6 +338,7 @@ it.effect("lets a cut blocking delegate_task wake its parent like an async task"
           IdAllocator.layer,
           Layer.mock(EffectWorker.OrchestrationEffectWorkerV2)({}),
           Layer.mock(EffectOutbox.EffectOutboxV2)({
+            listUnsettled: () => Effect.succeed([]),
             reconcileAfterProcessLoss: Effect.succeed({ requeued: 0, cancelled: 0 }),
           }),
         ),
@@ -403,6 +405,7 @@ it.effect.each(["running", "waiting"])(
             Layer.mock(EffectWorker.OrchestrationEffectWorkerV2)({}),
             Layer.mock(EffectOutbox.EffectOutboxV2)({
               listByCommandId: () => Effect.succeed([]),
+              listUnsettled: () => Effect.succeed([]),
               reconcileAfterProcessLoss: Effect.succeed({ requeued: 0, cancelled: 0 }),
             }),
           ),
@@ -658,6 +661,7 @@ it.effect.each([
               }),
               Layer.mock(EffectOutbox.EffectOutboxV2)({
                 listByCommandId: () => Effect.succeed([]),
+                listUnsettled: () => Effect.succeed([]),
                 reconcileAfterProcessLoss: Effect.succeed({ requeued: 0, cancelled: 0 }),
               }),
             ),
@@ -813,6 +817,7 @@ it.effect("does not cancel or resume a run that completes while shutdown intent 
             runRecoveryOnce: Effect.succeed(false),
           }),
           Layer.mock(EffectOutbox.EffectOutboxV2)({
+            listUnsettled: () => Effect.succeed([]),
             reconcileAfterProcessLoss: Effect.succeed({ requeued: 0, cancelled: 0 }),
           }),
         ),

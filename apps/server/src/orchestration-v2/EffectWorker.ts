@@ -124,8 +124,7 @@ export const layerExecutor: Layer.Layer<
                       threadId: effect.threadId,
                       providerSessionId: request.providerSessionId,
                       providerThreadId: request.providerThreadId,
-                      taskIds: request.taskIds,
-                      onlyForReleasedSession: true,
+                      taskIds: request.tasks.map((task) => task.taskId),
                     }).pipe(
                       Effect.catchCause((cause) =>
                         Effect.logWarning(

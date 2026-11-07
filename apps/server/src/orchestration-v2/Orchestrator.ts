@@ -10813,6 +10813,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
               ? "idle"
               : providerThread.status,
           pendingBackgroundTasks: [],
+          backgroundWorkStoppedAt: input.now,
           updatedAt: input.now,
         },
       });

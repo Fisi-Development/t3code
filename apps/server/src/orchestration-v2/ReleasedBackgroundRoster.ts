@@ -11,7 +11,6 @@ export const removeReleasedBackgroundTasks = Effect.fn("ReleasedBackgroundRoster
     readonly providerSessionId: ProviderSessionId;
     readonly providerThreadId: ProviderThreadId;
     readonly taskIds: ReadonlyArray<string>;
-    readonly onlyForReleasedSession?: true;
   }) {
     const projectionStore = yield* ProjectionStore.ProjectionStoreV2;
     const eventSink = yield* EventSink.EventSinkV2;
@@ -26,13 +25,7 @@ export const removeReleasedBackgroundTasks = Effect.fn("ReleasedBackgroundRoster
       );
       const tasks = providerThread?.pendingBackgroundTasks ?? [];
       const remaining = tasks.filter((task) => !taskIds.has(task.taskId));
-      if (
-        providerThread === undefined ||
-        (input.onlyForReleasedSession === true &&
-          providerThread.providerSessionId !== input.providerSessionId) ||
-        remaining.length === tasks.length
-      )
-        return;
+      if (providerThread === undefined || remaining.length === tasks.length) return;
       const now = yield* DateTime.now;
       const { committed } = yield* eventSink.writeIfProviderThreadUnchanged({
         expected: providerThread,
