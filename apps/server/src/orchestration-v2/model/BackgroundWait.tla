@@ -30,8 +30,11 @@
 (* provider thread. It stands down only for a user Stop recorded on the   *)
 (* provider thread after the release (persisted, so it survives a         *)
 (* restart) or an archive, and removes the tasks from the roster whichever *)
-(* session owns it. Restart recovery and a later release skip work that a *)
-(* pending notice effect already covers.                                  *)
+(* session owns it, and ends the command's turn item in the same write.  *)
+(* Restart recovery and a later release skip work that a pending notice   *)
+(* effect already covers. The later release re-reads the roster and      *)
+(* inserts its effect only if the provider thread is unchanged since that *)
+(* read, so its check and insert are one step here.                      *)
 (* Carried = FALSE with Fixed = TRUE is round 2 (commit a66a6f18c2): the   *)
 (* handler delivers only while the released session owns the provider     *)
 (* thread and the roster still lists the work, and stands down on settle. *)
@@ -58,8 +61,10 @@
 (*                   thread's effects in insertion order) and attaches a   *)
 (*                   new session to the provider thread; that session can *)
 (*                   itself be released before the first notice has run    *)
-(*   "restart"     - the server restarts after the release and before the  *)
-(*                   notice effect has run                                 *)
+(*   "restart"     - the server restarts after the release, before or     *)
+(*                   after the notice effect has run. Recovery records     *)
+(*                   work it finds in the roster or as an open turn item   *)
+(*                   (also on a completed run).                            *)
 (***************************************************************************)
 EXTENDS Naturals
 
@@ -90,11 +95,12 @@ VARIABLES
   archived,
   settled,
   replaced,     \* a replacement session owns the provider thread
+  itemOpen,     \* the command's turn item is still nonterminal
   hist          \* ghost: orderings seen, for the probes
 
 vars == <<roster, awaitedEver, proc, session, turn, pending, keyUsed, noticeMsg, extra,
           extraMsg, replays, wakes, notices, failed, restartNoted, noteStored, startQueued,
-          restarted, stopped, stopRecord, archived, settled, replaced, hist>>
+          restarted, stopped, stopRecord, archived, settled, replaced, itemOpen, hist>>
 
 TypeOK ==
   /\ roster \in {"none", "unawaited", "awaited"}
@@ -102,7 +108,7 @@ TypeOK ==
   /\ session \in {"live", "closed"}
   /\ turn \in {"running", "idle"}
   /\ {pending, keyUsed, noticeMsg, extra, extraMsg, awaitedEver, noteStored, startQueued,
-      restarted, stopped, stopRecord, archived, settled, replaced} \subseteq BOOLEAN
+      restarted, stopped, stopRecord, archived, settled, replaced, itemOpen} \subseteq BOOLEAN
   /\ {wakes, notices, failed, restartNoted, replays} \subseteq 0..3
   /\ hist \subseteq {"restartOwed", "settleOwed", "suppressed", "replacementReleased"}
 
@@ -118,7 +124,7 @@ Init ==
   /\ wakes = 0 /\ notices = 0 /\ failed = 0 /\ restartNoted = 0
   /\ noteStored = FALSE /\ startQueued = FALSE /\ restarted = FALSE
   /\ stopped = FALSE /\ stopRecord = FALSE /\ archived = FALSE /\ settled = FALSE
-  /\ replaced = FALSE /\ hist = {}
+  /\ replaced = FALSE /\ itemOpen = TRUE /\ hist = {}
 
 \* Work the user can Stop: the command runs or the roster still lists it.
 Open == proc = "running" \/ roster # "none"
@@ -128,20 +134,22 @@ Owed == (pending /\ ~noticeMsg) \/ (extra /\ ~extraMsg)
 Delivered == wakes + notices + failed + restartNoted
 \* A pending notice effect already names the work.
 Covered == Carried /\ pending
+\* Recovery records the work it finds in the roster or as an open turn item.
+Uncovered == (roster = "awaited" \/ (awaitedEver /\ itemOpen)) /\ ~Covered
 
 \* t3_background_wait matches the command in the live roster.
 Await ==
   /\ turn = "running" /\ session = "live" /\ roster = "unawaited" /\ proc = "running"
   /\ roster' = "awaited"
   /\ awaitedEver' = TRUE
-  /\ UNCHANGED <<proc, session, turn, pending, keyUsed, noticeMsg, extra, extraMsg, replays,
+  /\ UNCHANGED <<itemOpen, proc, session, turn, pending, keyUsed, noticeMsg, extra, extraMsg, replays,
                  wakes, notices, failed, restartNoted, noteStored, startQueued, restarted,
                  stopped, stopRecord, archived, settled, replaced, hist>>
 
 EndTurn ==
   /\ turn = "running" /\ session = "live"
   /\ turn' = "idle"
-  /\ UNCHANGED <<roster, awaitedEver, proc, session, pending, keyUsed, noticeMsg, extra,
+  /\ UNCHANGED <<itemOpen, roster, awaitedEver, proc, session, pending, keyUsed, noticeMsg, extra,
                  extraMsg, replays, wakes, notices, failed, restartNoted, noteStored,
                  startQueued, restarted, stopped, stopRecord, archived, settled, replaced,
                  hist>>
@@ -152,6 +160,7 @@ Complete ==
   /\ proc = "running" /\ session = "live"
   /\ proc' = "done"
   /\ roster' = "none"
+  /\ itemOpen' = FALSE
   /\ wakes' = wakes + 1
   /\ UNCHANGED <<awaitedEver, session, turn, pending, keyUsed, noticeMsg, extra, extraMsg,
                  replays, notices, failed, restartNoted, noteStored, startQueued, restarted,
@@ -162,7 +171,7 @@ QueueStart ==
   /\ "replacement" \in Races
   /\ ~startQueued /\ ~keyUsed /\ ~archived
   /\ startQueued' = TRUE
-  /\ UNCHANGED <<roster, awaitedEver, proc, session, turn, pending, keyUsed, noticeMsg, extra,
+  /\ UNCHANGED <<itemOpen, roster, awaitedEver, proc, session, turn, pending, keyUsed, noticeMsg, extra,
                  extraMsg, replays, wakes, notices, failed, restartNoted, noteStored,
                  restarted, stopped, stopRecord, archived, settled, replaced, hist>>
 
@@ -186,16 +195,16 @@ Release(cause) ==
        THEN IF ~replaced
               THEN /\ pending' = (pending \/ ~keyUsed)  \* the insert is keyed: a retry is a no-op
                    /\ keyUsed' = TRUE
-                   /\ UNCHANGED <<roster, extra, hist>>
+                   /\ UNCHANGED <<itemOpen, roster, extra, hist>>
               ELSE /\ extra' = (extra \/ (~Covered /\ ~extraMsg))
                    /\ hist' = hist \union {"replacementReleased"}
-                   /\ UNCHANGED <<roster, pending, keyUsed>>
+                   /\ UNCHANGED <<itemOpen, roster, pending, keyUsed>>
        ELSE /\ roster' = "none"
-            /\ UNCHANGED <<pending, keyUsed, extra, hist>>
+            /\ UNCHANGED <<itemOpen, pending, keyUsed, extra, hist>>
   /\ failed' = IF turn = "running" /\ roster = "awaited" THEN failed + 1 ELSE failed
   /\ turn' = "idle"
   /\ settled' = (settled \/ cause = "settle")
-  /\ UNCHANGED <<awaitedEver, noticeMsg, extraMsg, replays, wakes, notices, restartNoted,
+  /\ UNCHANGED <<itemOpen, awaitedEver, noticeMsg, extraMsg, replays, wakes, notices, restartNoted,
                  noteStored, startQueued, restarted, stopped, stopRecord, archived, replaced>>
 
 IdleRelease == "idle" \in Events /\ turn = "idle" /\ Release("idle")
@@ -215,7 +224,7 @@ SettleClosed ==
   /\ Fixed => roster # "awaited"
   /\ settled' = TRUE
   /\ hist' = IF Owed THEN hist \union {"settleOwed"} ELSE hist
-  /\ UNCHANGED <<roster, awaitedEver, proc, session, turn, pending, keyUsed, noticeMsg, extra,
+  /\ UNCHANGED <<itemOpen, roster, awaitedEver, proc, session, turn, pending, keyUsed, noticeMsg, extra,
                  extraMsg, replays, wakes, notices, failed, restartNoted, noteStored,
                  startQueued, restarted, stopped, stopRecord, archived, replaced>>
 
@@ -226,6 +235,7 @@ Stop ==
   /\ stopped' = (Delivered = 0)
   /\ stopRecord' = TRUE
   /\ roster' = "none"
+  /\ itemOpen' = FALSE  \* Stop interrupts pending background items
   /\ proc' = IF proc = "running" THEN "killed" ELSE proc
   /\ turn' = "idle"
   /\ UNCHANGED <<awaitedEver, session, pending, keyUsed, noticeMsg, extra, extraMsg, replays,
@@ -242,7 +252,7 @@ Archive ==
   /\ proc' = IF proc = "running" THEN "killed" ELSE proc
   /\ session' = "closed"
   /\ turn' = "idle"
-  /\ UNCHANGED <<awaitedEver, pending, keyUsed, noticeMsg, extra, extraMsg, replays, wakes,
+  /\ UNCHANGED <<itemOpen, awaitedEver, pending, keyUsed, noticeMsg, extra, extraMsg, replays, wakes,
                  notices, failed, restartNoted, noteStored, startQueued, restarted,
                  stopRecord, settled, replaced, hist>>
 
@@ -252,14 +262,14 @@ Archive ==
 \* that a pending notice effect already covers.
 ServerRestart ==
   /\ ~restarted
-  /\ session = "live" \/ ("restart" \in Races /\ pending)
+  /\ session = "live" \/ ("restart" \in Races /\ keyUsed)
   /\ restarted' = TRUE
   /\ IF session = "live"
-       THEN /\ restartNoted' = IF roster = "awaited" /\ ~Covered
-                                 THEN restartNoted + 1 ELSE restartNoted
+       THEN /\ restartNoted' = IF Uncovered THEN restartNoted + 1 ELSE restartNoted
             /\ UNCHANGED noteStored
-       ELSE /\ noteStored' = (noteStored \/ (roster = "awaited" /\ ~Covered))
+       ELSE /\ noteStored' = (noteStored \/ Uncovered)
             /\ UNCHANGED restartNoted
+  /\ itemOpen' = FALSE
   /\ hist' = IF Owed THEN hist \union {"restartOwed"} ELSE hist
   /\ roster' = "none"
   /\ session' = "closed"
@@ -276,7 +286,7 @@ Replace ==
   /\ startQueued /\ pending /\ ~replaced /\ session = "closed" /\ ~archived
   /\ replaced' = TRUE
   /\ session' = "live"
-  /\ UNCHANGED <<roster, awaitedEver, proc, turn, pending, keyUsed, noticeMsg, extra,
+  /\ UNCHANGED <<itemOpen, roster, awaitedEver, proc, turn, pending, keyUsed, noticeMsg, extra,
                  extraMsg, replays, wakes, notices, failed, restartNoted, noteStored,
                  startQueued, restarted, stopped, stopRecord, archived, settled, hist>>
 
@@ -296,7 +306,7 @@ DispatchNotice ==
   /\ pending /\ Sendable(TRUE) /\ ~noticeMsg
   /\ noticeMsg' = TRUE
   /\ notices' = notices + 1
-  /\ UNCHANGED <<roster, awaitedEver, proc, session, turn, pending, keyUsed, extra, extraMsg,
+  /\ UNCHANGED <<itemOpen, roster, awaitedEver, proc, session, turn, pending, keyUsed, extra, extraMsg,
                  replays, wakes, failed, restartNoted, noteStored, startQueued, restarted,
                  stopped, stopRecord, archived, settled, replaced, hist>>
 
@@ -307,6 +317,7 @@ Acknowledge ==
   /\ pending /\ (noticeMsg \/ ~Sendable(TRUE))
   /\ pending' = FALSE
   /\ roster' = IF replaced /\ ~Carried THEN roster ELSE "none"
+  /\ itemOpen' = IF Carried THEN FALSE ELSE itemOpen
   /\ hist' = IF noticeMsg THEN hist ELSE hist \union {"suppressed"}
   /\ UNCHANGED <<awaitedEver, proc, session, turn, keyUsed, noticeMsg, extra, extraMsg,
                  replays, wakes, notices, failed, restartNoted, noteStored, startQueued,
@@ -317,7 +328,7 @@ DispatchExtra ==
   /\ extra /\ ~pending /\ Sendable(FALSE) /\ ~extraMsg
   /\ extraMsg' = TRUE
   /\ notices' = notices + 1
-  /\ UNCHANGED <<roster, awaitedEver, proc, session, turn, pending, keyUsed, noticeMsg, extra,
+  /\ UNCHANGED <<itemOpen, roster, awaitedEver, proc, session, turn, pending, keyUsed, noticeMsg, extra,
                  replays, wakes, failed, restartNoted, noteStored, startQueued, restarted,
                  stopped, stopRecord, archived, settled, replaced, hist>>
 
@@ -325,6 +336,7 @@ AcknowledgeExtra ==
   /\ extra /\ ~pending /\ (extraMsg \/ ~Sendable(FALSE))
   /\ extra' = FALSE
   /\ roster' = "none"
+  /\ itemOpen' = IF Carried THEN FALSE ELSE itemOpen
   /\ UNCHANGED <<awaitedEver, proc, session, turn, pending, keyUsed, noticeMsg, extraMsg,
                  replays, wakes, notices, failed, restartNoted, noteStored, startQueued,
                  restarted, stopped, stopRecord, archived, settled, replaced, hist>>
@@ -334,7 +346,7 @@ Replay ==
   /\ keyUsed /\ ~pending /\ replays = 0
   /\ pending' = TRUE
   /\ replays' = 1
-  /\ UNCHANGED <<roster, awaitedEver, proc, session, turn, keyUsed, noticeMsg, extra,
+  /\ UNCHANGED <<itemOpen, roster, awaitedEver, proc, session, turn, keyUsed, noticeMsg, extra,
                  extraMsg, wakes, notices, failed, restartNoted, noteStored, startQueued,
                  restarted, stopped, stopRecord, archived, settled, replaced, hist>>
 
@@ -386,4 +398,5 @@ ProbeReplayAfterStandDown == ~("suppressed" \in hist /\ replays = 1 /\ ~pending)
 ProbeFailedTurn == ~(failed = 1)
 ProbeRestartContinuation == ~(restartNoted = 1)
 ProbeNativeWake == ~(awaitedEver /\ wakes = 1)
+ProbeRestartAfterNotice == ~(notices = 1 /\ restarted /\ "restartOwed" \notin hist /\ ~pending)
 =============================================================================

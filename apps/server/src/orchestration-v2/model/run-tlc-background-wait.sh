@@ -70,7 +70,7 @@ fi
 
 for probe in NoticeAfterReplacement ReplacementReleasedBeforeNotice RestartBeforeNotice \
   SettleBeforeNotice StopStandsDown StopAcrossRestart ReplayOnce ReplayAfterStandDown \
-  FailedTurn RestartContinuation NativeWake; do
+  FailedTurn RestartContinuation NativeWake RestartAfterNotice; do
   run "probe-$probe" TRUE TRUE "$ALL_CAUSES" "$ALL_RACES" "Probe$probe"
   expect_violation "probe $probe reachable" "Probe$probe"
 done
