@@ -17,6 +17,7 @@ import {
   ProviderDriverKind,
   ProviderInstanceId,
   type ProviderSessionId,
+  ProviderTurnId,
   ThreadId,
 } from "@t3tools/contracts";
 import * as Cause from "effect/Cause";
@@ -33,6 +34,8 @@ import * as Ref from "effect/Ref";
 import * as Stream from "effect/Stream";
 import * as SqlClient from "effect/sql/SqlClient";
 import * as EffectWorker from "./EffectWorker.ts";
+import * as EffectOutbox from "./EffectOutbox.ts";
+import * as ProviderRuntimeRecovery from "./ProviderRuntimeRecoveryService.ts";
 import * as Orchestrator from "./Orchestrator.ts";
 import * as ProviderReplayHarness from "./testkit/ProviderReplayHarness.ts";
 import { TestClock } from "effect/testing";
@@ -4430,6 +4433,26 @@ it.effect.each([
     true,
   ],
   ["a retried release record delivers one notice", "retry", true, true],
+  [
+    "a user message queued before the notice still gets the notice after its run",
+    "replacement",
+    true,
+    true,
+  ],
+  [
+    "a restart between the release and the notice delivers one notice and no restart note for the same work",
+    "restart",
+    true,
+    true,
+  ],
+  ["a settle after a restart does not silence the owed notice", "settle-restart", true, true],
+  ["a user Stop after the release stands the notice down", "stop", true, false],
+  [
+    "a user Stop after the release stands the notice down across a restart",
+    "stop-restart",
+    true,
+    false,
+  ],
   ["unawaited background work is released quietly", "idle", false, false],
   // The failed turn is the outcome; a notice would start a second run after it.
   [
@@ -4452,6 +4475,10 @@ it.effect.each([
       const idAllocator = yield* IdAllocator.IdAllocatorV2;
       const projections = yield* ProjectionStore.ProjectionStoreV2;
       const sql = yield* SqlClient.SqlClient;
+      const orchestrator = yield* Orchestrator.OrchestratorV2;
+      const race = ["replacement", "restart", "settle-restart", "stop", "stop-restart"].includes(
+        mode,
+      );
       const now = yield* DateTime.now;
       const threadId = ThreadId.make("thread:released-notice");
       const providerSessionId = yield* idAllocator.allocate.providerSession({
@@ -4480,6 +4507,71 @@ it.effect.each([
           },
         ],
       });
+      if (race) {
+        yield* orchestrator.dispatch({
+          type: "message.dispatch",
+          commandId: CommandId.make("command:initial-work"),
+          threadId,
+          messageId: yield* idAllocator.allocate.message({ threadId, ordinal: 1 }),
+          text: "work",
+          attachments: [],
+          dispatchMode: { type: "start_immediately" },
+          createdBy: "user",
+          creationSource: "web",
+        });
+        const run = (yield* projections.getThreadProjection(threadId)).runs[0]!;
+        yield* eventSink.write({
+          events: [
+            {
+              id: yield* idAllocator.allocate.event({ threadId }),
+              type: "run.updated",
+              threadId,
+              occurredAt: now,
+              payload: {
+                ...run,
+                providerThreadId: providerThread.id,
+                status: "completed",
+                startedAt: now,
+                completedAt: now,
+              },
+            },
+          ],
+        });
+        yield* eventSink.write({
+          events: [
+            {
+              id: yield* idAllocator.allocate.event({ threadId }),
+              type: "provider-turn.updated",
+              threadId,
+              occurredAt: now,
+              payload: {
+                id: ProviderTurnId.make("turn:released-notice"),
+                providerThreadId: providerThread.id,
+                nodeId: run.rootNodeId!,
+                runAttemptId: run.activeAttemptId!,
+                nativeTurnRef: null,
+                ordinal: 1,
+                status: "completed",
+                startedAt: now,
+                completedAt: now,
+              },
+            },
+          ],
+        });
+        if (mode === "replacement") {
+          yield* orchestrator.dispatch({
+            type: "message.dispatch",
+            commandId: CommandId.make("command:queued-user"),
+            threadId,
+            messageId: yield* idAllocator.allocate.message({ threadId, ordinal: 2 }),
+            text: "queued before release",
+            attachments: [],
+            dispatchMode: { type: "queue_after_active" },
+            createdBy: "user",
+            creationSource: "web",
+          });
+        }
+      }
       const afterSequence = yield* eventSink.latestSequence({ threadId });
       const runtime = yield* manager.open({
         threadId,
@@ -4509,7 +4601,7 @@ it.effect.each([
           runtimePolicy,
         });
         yield* manager.release({ providerSessionId, reason: "runtime_error" });
-      } else if (mode === "idle") {
+      } else if (mode === "idle" || race) {
         yield* TestClock.adjust("3 seconds");
       } else if (mode === "crash") {
         yield* eventSink
@@ -4537,18 +4629,72 @@ it.effect.each([
       const effects = yield* sql<{ effect_id: string; payload_json: string }>`
         SELECT effect_id, payload_json FROM orchestration_v2_effect_outbox
         WHERE thread_id = ${threadId} AND effect_type = 'background-work.released'`;
-      assert.lengthOf(effects, notice ? 1 : 0, "notice effects persisted by the release");
+      assert.lengthOf(effects, notice || race ? 1 : 0, "notice effects persisted by the release");
       const roster =
         (yield* projections.getThreadRecords(threadId, ["providerThreads"])).providerThreads[0]!
           .pendingBackgroundTasks ?? [];
       assert.deepEqual(
         roster.map((task) => task.taskId),
-        notice ? ["b78m03be3"] : [],
+        notice || race ? ["b78m03be3"] : [],
       );
       if (notice) {
         const request = JSON.parse(effects[0]!.payload_json);
         assert.deepEqual(request.taskIds, ["b78m03be3"]);
         assert.equal(request.reason, mode === "crash" ? "runtime_error" : "idle_timeout");
+      }
+      if (mode === "replacement") {
+        const current = (yield* projections.getThreadRecords(threadId, [
+          "providerThreads",
+        ])).providerThreads.find((thread) => thread.id === providerThread.id)!;
+        yield* eventSink.write({
+          events: [
+            {
+              id: yield* idAllocator.allocate.event({ threadId }),
+              type: "provider-thread.updated",
+              threadId,
+              occurredAt: yield* DateTime.now,
+              payload: {
+                ...current,
+                providerSessionId: yield* idAllocator.allocate.providerSession({
+                  threadId,
+                  providerInstanceId: modelSelection.instanceId,
+                }),
+              },
+            },
+          ],
+        });
+      }
+      if (mode === "stop" || mode === "stop-restart") {
+        yield* orchestrator.dispatch({
+          type: "thread.stop",
+          commandId: CommandId.make("command:stop-release"),
+          threadId,
+        });
+      }
+      if (mode === "restart" || mode === "settle-restart" || mode === "stop-restart") {
+        const recovery = yield* ProviderRuntimeRecovery.make.pipe(
+          Effect.provide(
+            Layer.mergeAll(
+              ServerSettings.layerTest(),
+              IdAllocator.layer,
+              EffectOutbox.layer.pipe(Layer.provide(layerTestDatabase)),
+            ),
+          ),
+        );
+        yield* recovery.reconcile("startup");
+        const recovered = yield* projections.getThreadProjection(threadId);
+        assert.isEmpty(
+          recovered.runs.flatMap((run) => run.restartCancelledBackgroundWork ?? []),
+          "released work must not also be recorded as restart-cancelled",
+        );
+        assert.isEmpty(recovered.providerThreads[0]!.pendingBackgroundTasks ?? []);
+      }
+      if (mode === "settle-restart") {
+        yield* orchestrator.dispatch({
+          type: "thread.settle",
+          commandId: CommandId.make("command:settle-release"),
+          threadId,
+        });
       }
       yield* (yield* EffectWorker.OrchestrationEffectWorkerV2).drain();
       const delivered = yield* projections.getThreadProjection(threadId);
@@ -4557,6 +4703,18 @@ it.effect.each([
       );
       assert.lengthOf(notices, notice ? 1 : 0);
       assert.isEmpty(delivered.providerThreads[0]!.pendingBackgroundTasks ?? []);
+      if (mode === "replacement") {
+        assert.isAbove(
+          delivered.messages.indexOf(notices[0]!),
+          delivered.messages.findIndex((message) => message.text === "queued before release"),
+        );
+      }
+      assert.isFalse(
+        delivered.messages.some(
+          (message) =>
+            message.text.includes("server restarted") && message.text.includes("b78m03be3"),
+        ),
+      );
       if (notice) {
         assert.equal(
           String(notices[0]!.id),
