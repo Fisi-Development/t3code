@@ -191,6 +191,7 @@ export interface ProviderSessionManagerV2Shape {
     readonly threadId: ThreadId;
     readonly detail?: string;
     readonly revokeMcpCredential?: boolean;
+    readonly notifyHeldBackgroundWork?: boolean;
   }) => Effect.Effect<void, ProviderSessionManagerV2Error>;
   /**
    * Releases the session unless, at the moment of removal, a turn of a provider thread outside
@@ -814,6 +815,7 @@ export const layerWithOptions = (
         "ProviderSessionManager.writeReleasedBackgroundWorkEvents",
       )(function* (input: {
         readonly entry: Pick<LiveSessionEntry, "busyTurns">;
+        readonly notifyHeldBackgroundWork?: boolean;
         readonly releasedBackgroundTasks: ReadonlyArray<ReleasedBackgroundTasks>;
         readonly reason: ProviderSessionReleaseReason;
         readonly detail?: string;
@@ -832,7 +834,9 @@ export const layerWithOptions = (
             turnKey.startsWith(busyTurnPrefix(providerThreadId)),
           );
           if (
-            (input.reason === "idle_timeout" || input.reason === "runtime_error") &&
+            (input.reason === "idle_timeout" ||
+              input.reason === "runtime_error" ||
+              (input.reason === "manual_shutdown" && input.notifyHeldBackgroundWork === true)) &&
             !turnWasRunning &&
             backgroundWorkHoldsCompletion(tasks)
           ) {
@@ -848,7 +852,7 @@ export const layerWithOptions = (
                     type: "background-work.released",
                     providerThreadId,
                     providerSessionId,
-                    reason: input.reason,
+                    reason: input.reason === "manual_shutdown" ? "detached" : input.reason,
                     taskIds,
                     ...(input.detail === undefined ? {} : { detail: input.detail }),
                   },
@@ -874,6 +878,7 @@ export const layerWithOptions = (
         readonly entry: LiveSessionEntry;
         readonly reason: ProviderSessionReleaseReason;
         readonly detail?: string;
+        readonly notifyHeldBackgroundWork?: boolean;
         readonly releasedBackgroundTasks: ReadonlyArray<ReleasedBackgroundTasks>;
         readonly releasedAt: DateTime.Utc;
         readonly replaced: boolean;
@@ -1033,6 +1038,7 @@ export const layerWithOptions = (
         readonly reason: ProviderSessionReleaseReason;
         readonly detail?: string;
         readonly detachedThreadId?: ThreadId;
+        readonly notifyHeldBackgroundWork?: boolean;
         readonly cancelIdleFiber?: boolean;
         readonly onlyIfIdleGeneration?: number;
         readonly keepIfBusyOtherThan?: ReadonlyArray<ProviderThreadId>;
@@ -1073,6 +1079,9 @@ export const layerWithOptions = (
                     entry,
                     reason: input.reason,
                     ...(input.detail === undefined ? {} : { detail: input.detail }),
+                    ...(input.notifyHeldBackgroundWork === undefined
+                      ? {}
+                      : { notifyHeldBackgroundWork: input.notifyHeldBackgroundWork }),
                     releasedBackgroundTasks,
                     releasedAt,
                   };
@@ -2539,6 +2548,9 @@ export const layerWithOptions = (
                 reason: "manual_shutdown",
                 ...(input.detail === undefined ? {} : { detail: input.detail }),
                 detachedThreadId: input.threadId,
+                ...(input.notifyHeldBackgroundWork === undefined
+                  ? {}
+                  : { notifyHeldBackgroundWork: input.notifyHeldBackgroundWork }),
               });
               return;
             }

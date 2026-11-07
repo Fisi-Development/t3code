@@ -34,7 +34,7 @@ export const OrchestrationEffectRequestV2 = Schema.Union([
     type: Schema.Literal("background-work.released"),
     providerThreadId: ProviderThreadId,
     providerSessionId: ProviderSessionId,
-    reason: Schema.Literals(["idle_timeout", "runtime_error"]),
+    reason: Schema.Literals(["idle_timeout", "runtime_error", "detached"]),
     detail: Schema.optional(Schema.String),
     taskIds: Schema.Array(Schema.String),
   }),
@@ -47,6 +47,7 @@ export const OrchestrationEffectRequestV2 = Schema.Union([
     providerSessionId: ProviderSessionId,
     detail: Schema.optional(Schema.String),
     revokeMcpCredential: Schema.optional(Schema.Boolean),
+    notifyHeldBackgroundWork: Schema.optional(Schema.Boolean),
   }),
   Schema.Struct({
     type: Schema.Literal("provider-turn.start"),

@@ -175,6 +175,9 @@ export const layerExecutor: Layer.Layer<
                 providerSessionId: effect.request.providerSessionId,
                 threadId: effect.threadId,
                 ...(effect.request.detail === undefined ? {} : { detail: effect.request.detail }),
+                ...(effect.request.notifyHeldBackgroundWork === undefined
+                  ? {}
+                  : { notifyHeldBackgroundWork: effect.request.notifyHeldBackgroundWork }),
                 ...(effect.request.revokeMcpCredential === undefined
                   ? {}
                   : { revokeMcpCredential: effect.request.revokeMcpCredential }),

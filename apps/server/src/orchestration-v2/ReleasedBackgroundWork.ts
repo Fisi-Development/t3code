@@ -44,10 +44,15 @@ export const deliverReleasedBackgroundWork = Effect.fn("ReleasedBackgroundWork.d
       projection.thread.settledOverride !== "settled" &&
       !projection.messages.some((message) => message.id === messageId)
     ) {
+      const detail = input.request.detail
+        ?.replace(/\.$/, "")
+        .replace(/^./, (first) => first.toLowerCase());
       const reason =
         input.request.reason === "idle_timeout"
           ? "its provider session was closed after a long time without activity"
-          : `the provider process exited unexpectedly${input.request.detail === undefined ? "" : `: ${input.request.detail}`}`;
+          : input.request.reason === "detached"
+            ? `its provider session was closed when the thread changed${detail ? ` (${detail})` : ""}`
+            : `the provider process exited unexpectedly${input.request.detail === undefined ? "" : `: ${input.request.detail}`}`;
       const text = [
         `Note: this background work stopped before it reported back, because ${reason}. It will not report on its own, so check its output, then rerun what you still need and wait for its result:`,
         ...held.slice(0, 10).map((task) => {

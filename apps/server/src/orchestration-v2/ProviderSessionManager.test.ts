@@ -4690,7 +4690,7 @@ it.effect.each([
       );
       assert.lengthOf(notices, reason === null ? 0 : 1);
       assert.isEmpty(delivered.providerThreads[0]!.pendingBackgroundTasks ?? []);
-      assert.isFalse(yield* manager.isLive(providerSessionId));
+      assert.equal((yield* Ref.get(state)).closeCount, 1);
       if (reason !== null) {
         assert.include(notices[0]!.text, "b78m03be3");
         assert.include(notices[0]!.text, reason);

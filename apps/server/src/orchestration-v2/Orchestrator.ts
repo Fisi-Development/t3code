@@ -4401,6 +4401,12 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
                         : command.type === "thread.runtime-mode.set"
                           ? "Runtime mode changed."
                           : "Provider or model selection changed.",
+                ...(command.type === "thread.metadata.update" ||
+                command.type === "thread.runtime-mode.set" ||
+                command.type === "thread.model-selection.set" ||
+                command.type === "provider.switch"
+                  ? { notifyHeldBackgroundWork: true }
+                  : {}),
                 // Terminal detaches revoke MCP credentials; reattachments need other detach reasons to preserve them.
                 ...(command.type === "thread.archive" ? { revokeMcpCredential: true } : {}),
               },
